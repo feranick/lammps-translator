@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lammps-translator"
+version = "2026.10.16.1"
+description = "Atomistic studies (structure, potential, ordered stages) -> LAMMPS inputs and checked results; CLI, API and MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Nicola Ferralis", email = "ferralis@generalflash.com" }]
+license = { text = "MIT" }
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+test = ["pytest>=7"]
+lammps = ["lammps>=2024.8.29"]
+
+[project.scripts]
+lmpt = "lammps_translator.cli:main"
+lmpt-mcp = "lammps_translator.mcp_server:main"
+
+[tool.setuptools]
+packages = ["lammps_translator"]

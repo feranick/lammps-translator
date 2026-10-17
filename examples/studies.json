@@ -1,0 +1,66 @@
+{
+  "cu_properties": {
+    "description": "Cu (Foiles-Baskes-Daw EAM): lattice constant, cohesive energy, Cij, vacancy, (111) surface",
+    "system": {"lattice": "fcc", "a": 3.6, "elements": ["Cu"], "size": [4, 4, 4]},
+    "potential": {"style": "eam", "file": "Cu_u3.eam"},
+    "stages": [{"kind": "minimize", "box": "iso"}, {"kind": "elastic"}, {"kind": "eos"}, {"kind": "vacancy"},
+               {"kind": "surface", "miller": [1, 1, 1]}],
+    "expect": [{"quantity": "minimize.a_A", "value": 3.615, "tol": 0.001},
+               {"quantity": "minimize.E_coh_eV", "value": 3.54, "tol": 0.002}]
+  },
+  "si_tersoff": {
+    "system": {"lattice": "diamond", "a": 5.43, "elements": ["Si"], "size": [3, 3, 3]},
+    "potential": {"style": "tersoff", "file": "Si.tersoff"},
+    "stages": [{"kind": "minimize", "box": "iso"}, {"kind": "elastic"},
+               {"kind": "surface", "miller": [1, 0, 0]}]
+  },
+  "cuni_thermal": {
+    "description": "random Cu-30Ni solid solution: lattice constant and thermal expansion (classical MD)",
+    "system": {"lattice": "fcc", "a": 3.58, "elements": ["Cu"], "size": [5, 5, 5],
+               "substitute": [{"from": "Cu", "to": "Ni", "fraction": 0.3}]},
+    "potential": {"style": "eam/alloy", "file": "CuNi.eam.alloy"},
+    "stages": [{"kind": "minimize", "box": "iso"}, {"kind": "elastic"},
+               {"kind": "thermal_expansion", "T": [100, 300, 500], "steps": 20000}]
+  },
+  "mgo_buckingham": {
+    "description": "MgO, Buckingham + Ewald (formal charges)",
+    "system": {"lattice": "rocksalt", "a": 4.21, "elements": ["Mg", "O"], "size": [2, 2, 2]},
+    "potential": {"style": "buck", "pairs": {"Mg-O": {"A": 1428.5, "rho": 0.2945, "C": 0.0},
+                                             "O-O": {"A": 22764.0, "rho": 0.149, "C": 27.88}},
+                  "charges": {"Mg": 2, "O": -2}, "cutoff": 8.0, "shift": true},
+    "stages": [{"kind": "minimize", "box": "iso"}, {"kind": "elastic"}, {"kind": "eos", "strain": 0.02}],
+    "expect": [{"quantity": "elastic.C44_GPa", "value": 164.3, "tol": 0.01}]
+  },
+  "ar_lj_md": {
+    "description": "solid argon (LJ): NPT at 40 K, then NVT with RDF and MSD, then NVE",
+    "system": {"lattice": "fcc", "a": 5.3, "elements": ["Ar"], "size": [4, 4, 4]},
+    "potential": {"style": "lj", "eps": 0.0104, "sigma": 3.405, "cutoff": 8.5, "shift": true},
+    "stages": [{"kind": "minimize", "box": "iso"},
+               {"kind": "npt", "T": 40, "P_bar": 0, "steps": 5000, "dt_fs": 2},
+               {"kind": "nvt", "T": 40, "steps": 5000, "dt_fs": 2, "rdf": {}, "msd": {}},
+               {"kind": "nve", "steps": 2000, "dt_fs": 2}]
+  },
+  "water_spce": {
+    "description": "SPC/E water, 216 molecules at 298 K and 1 atm (short; see the spce_water benchmark for a long run)",
+    "system": {"molecules": [{"molecule": "spce", "count": 216}], "density_g_cm3": 0.997},
+    "stages": [{"kind": "minimize"},
+               {"kind": "npt", "T": 298, "P_bar": 1.01325, "steps": 10000, "dt_fs": 2},
+               {"kind": "nvt", "T": 298, "steps": 10000, "dt_fs": 2, "rdf": {"pairs": [["OW", "OW"], ["OW", "HW"]]},
+                "msd": {"of": ["OW"]}}]
+  },
+  "butane_ua": {
+    "description": "liquid n-butane, TraPPE united atom (harmonic bonds instead of fixed ones), OPLS-form torsion",
+    "system": {"molecules": [{"molecule": {"name": "butane",
+                                           "atoms": [["CH3", 0, 0, 0], ["CH2", 1.54, 0, 0], ["CH2", 2.05, 1.45, 0],
+                                                     ["CH3", 3.59, 1.45, 0.3]],
+                                           "bonds": [[0, 1], [1, 2], [2, 3]]}, "count": 64}],
+               "density_g_cm3": 0.55},
+    "forcefield": {"types": {"CH3": {"mass": 15.035, "q": 0, "eps": 0.19475, "sigma": 3.75},
+                             "CH2": {"mass": 14.027, "q": 0, "eps": 0.09141, "sigma": 3.95}},
+                   "mixing": "arithmetic", "coulomb": "none", "cutoff": 14, "special": [0, 0, 0],
+                   "bonds": {"CH3-CH2": {"k": 260, "r0": 1.54}, "CH2-CH2": {"k": 260, "r0": 1.54}},
+                   "angles": {"CH3-CH2-CH2": {"k": 62.1, "theta0": 114}},
+                   "dihedrals": {"CH3-CH2-CH2-CH3": {"k": [1.411, -0.271, 3.145, 0.0]}}},
+    "stages": [{"kind": "minimize"}, {"kind": "nvt", "T": 250, "steps": 5000}]
+  }
+}
