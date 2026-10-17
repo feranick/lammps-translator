@@ -1,5 +1,5 @@
 """format.py — the study format (what an LLM reads first) and static validation with fixable messages.
-Version: 2026.10.16.1
+Version: 2026.10.16.2
 """
 from __future__ import annotations
 

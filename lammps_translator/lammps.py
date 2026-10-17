@@ -1,8 +1,9 @@
 """lammps.py — the only module that runs LAMMPS: finds the executable, reads its capabilities, runs inputs.
-Version: 2026.10.16.1
+Version: 2026.10.16.2
 
-Executable: LMPT_LMP (a command, e.g. 'lmp' or '/opt/lammps/bin/lmp_mpi'), else the first of lmp, lmp_mpi,
-lmp_serial, lammps on the PATH. MPI: LMPT_PROCS ranks (or the study's 'procs') through LMPT_MPIRUN ('mpirun').
+Executable: LMPT_LMP (a command, e.g. 'lmp', '/opt/lammps/bin/lmp_mpi' or 'mpirun -np 4 lmp'), else the first of
+lmp, lmp_mpi, lmp_serial, lmp_stable, lmp_openmpi, lammps on the PATH, else the same names in /usr/bin,
+/usr/local/bin, /opt/lammps/bin, ~/.local/bin. MPI: LMPT_PROCS ranks (or the study's 'procs') through LMPT_MPIRUN.
 """
 from __future__ import annotations
 
@@ -15,17 +16,41 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
+NAMES = ("lmp", "lmp_mpi", "lmp_serial", "lmp_stable", "lmp_openmpi", "lammps")
+DIRS = ("/usr/bin", "/usr/local/bin", "/opt/lammps/bin", "~/.local/bin")
+
+
+def _exe(name: str) -> str | None:
+    p = shutil.which(os.path.expanduser(name))
+    return p if p else None
+
 
 def find_lmp() -> list[str] | None:
     env = os.environ.get("LMPT_LMP")
     if env:
         cmd = shlex.split(env)
-        return cmd if shutil.which(cmd[0]) or Path(cmd[0]).is_file() else None
-    for name in ("lmp", "lmp_mpi", "lmp_serial", "lammps"):
-        p = shutil.which(name)
+        cmd[0] = os.path.expanduser(cmd[0])
+        return cmd if _exe(cmd[0]) else None
+    for name in NAMES:
+        p = _exe(name)
         if p:
             return [p]
+    for d in DIRS:
+        for name in NAMES:
+            p = _exe(str(Path(d).expanduser() / name))
+            if p:
+                return [p]
     return None
+
+
+def not_found() -> str:
+    env = os.environ.get("LMPT_LMP")
+    if env:
+        return (f"LAMMPS not found: LMPT_LMP='{env}' is not an executable on this machine (check the path, or "
+                "unset it to search the PATH)")
+    return (f"LAMMPS not found: none of {list(NAMES)} on the PATH or in {list(DIRS)}; set LMPT_LMP to the "
+            "executable (e.g. export LMPT_LMP=/usr/bin/lmp; for the MCP server put it in the ssh command: "
+            "env LMPT_LMP=... lmpt-mcp)")
 
 
 @lru_cache(maxsize=4)
@@ -52,7 +77,7 @@ def _info(cmd: tuple) -> dict:
 def lmp_info() -> dict:
     cmd = find_lmp()
     if cmd is None:
-        return {"error": "LAMMPS not found: install it (apt install lammps) or set LMPT_LMP"}
+        return {"error": not_found()}
     return _info(tuple(cmd))
 
 
@@ -76,7 +101,7 @@ def run(input_name: str, log_name: str, cwd: Path, procs: int = 1, timeout: floa
     """Runs LAMMPS on cwd/input_name, writing cwd/log_name. Returns rc, seconds, stderr tail."""
     cmd = find_lmp()
     if cmd is None:
-        return {"rc": -1, "error": "LAMMPS not found (set LMPT_LMP)", "seconds": 0.0}
+        return {"rc": -1, "error": not_found(), "seconds": 0.0}
     full = [*cmd, "-in", input_name, "-log", log_name, "-screen", "none"]
     if procs > 1:
         mpirun = shlex.split(os.environ.get("LMPT_MPIRUN", "mpirun"))

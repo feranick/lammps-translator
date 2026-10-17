@@ -53,7 +53,7 @@ A deterministic **translator + checker** for LLMs: the LLM writes a structured s
 
 ## State
 
-- 2026.10.16.1 (first version). Here, with LAMMPS 22 Jul 2025: 26 tests pass; default benchmarks 8/8 pass; reference check exact (≤1e-13) for lj, morse, buck, eam, eam/alloy, eam/fs, bonded terms; Ewald 2e-7 (LAMMPS's erfc). SPC/E short run: ρ 0.999 ± 0.003, U −46.78 kJ/mol. feat chain via MCP: Cu E = 124.7 GPa, ν 0.35 → cantilever 1.2786 vs 1.2832 mm.
+- 2026.10.16.2: clearer 'LAMMPS not found' (first server run reported 'no log' for every benchmark: LAMMPS was not found there; tests skipped). 2026.10.16.1 (first version). Here, with LAMMPS 22 Jul 2025: 27 tests pass; default benchmarks 8/8 pass; reference check exact (≤1e-13) for lj, morse, buck, eam, eam/alloy, eam/fs, bonded terms; Ewald 2e-7 (LAMMPS's erfc). SPC/E short run: ρ 0.999 ± 0.003, U −46.78 kJ/mol. feat chain via MCP: Cu E = 124.7 GPa, ν 0.35 → cantilever 1.2786 vs 1.2832 mm.
 - To do on the servers: `pytest -q`, `lmpt bench`, `lmpt bench spce_water chain_feat_cantilever`, check `lmpt status` finds /usr/share/lammps/potentials (else set LMPT_POTENTIALS).
 - Seen once in fea-translator 2026.10.16.9: the first run of a cantilever after a pause gave a wrong field (tip 0.968 mm, peak 53 GPa, lateral motion) with the same mesh counts; the identical study rerun gave 1.2786. Its equilibrium check (3.6e-7) did not catch it.
 - Open ideas: reference implementations of Tersoff and SW; hybrid (molecules on surfaces); tensile MD (stress–strain); phonons (fix phonon); Green–Kubo viscosity and thermal conductivity; melting point by two-phase coexistence; Yeh–Hummer correction for D; chemical potentials for compound defects.

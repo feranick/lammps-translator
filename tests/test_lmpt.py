@@ -1,4 +1,4 @@
-"""Tests for lammps-translator. Version: 2026.10.16.1
+"""Tests for lammps-translator. Version: 2026.10.16.2
 Most run anywhere (builder, validation, reference implementation, readers, analysis); the ones marked
 'needs LAMMPS' are skipped when no executable is found (set LMPT_LMP)."""
 import json
@@ -287,3 +287,10 @@ def test_rotated_cell_elastic_constants(tmp_path):
     assert o["elastic"]["C11_GPa"] == pytest.approx((C11 + C12 + 2 * C44) / 2, rel=3e-3)
     assert o["elastic"]["C33_GPa"] == pytest.approx((C11 + 2 * C12 + 4 * C44) / 3, rel=3e-3)
     assert c["checks"]["masses"]["pass"] and c["reliable"] and o["reliable"]
+
+
+def test_lammps_not_found_message(tmp_path, monkeypatch):
+    from lammps_translator.runner import run_study
+    monkeypatch.setenv("LMPT_LMP", str(tmp_path / "no_such_lmp"))
+    r = run_study("x", LJ, tmp_path / "x")
+    assert r["ok"] is False and "LMPT_LMP" in r["why"] and "not an executable" in r["why"]

@@ -1,5 +1,5 @@
 """runner.py — one study end to end: build, write inputs stage by stage, run LAMMPS, read, analyse, check.
-Version: 2026.10.16.1
+Version: 2026.10.16.2
 
 Folder layout (<request>/<study>/):
     initial.data, potentials/, 00_setup/ (in.lammps, log.lammps, forces0.dump), 01_<stage>/ ..., run_all.sh,
@@ -82,6 +82,9 @@ class Study:
 
     # ----------------------------------------------------------------------------- preparation
     def prepare(self):
+        from .lammps import find_lmp, not_found
+        if find_lmp() is None:
+            raise RuntimeError(not_found())
         st = self.study
         self.s0 = build_system(st)
         self.warnings += self.s0.warnings
@@ -132,6 +135,9 @@ class Study:
         r = lmp_run("in.lammps", "log.lammps", d, self.procs, remaining)
         self.lmp_seconds += r.get("seconds", 0.0)
         log = read_log(d / "log.lammps")
+        if not (d / "log.lammps").is_file():
+            why = r.get("error") or r.get("stderr") or f"exit code {r['rc']}"
+            raise RuntimeError(f"LAMMPS did not start in {sid} ({r.get('command', '')}): {why[:800]}")
         if r["rc"] != 0 or log["errors"]:
             why = log["errors"][0] if log["errors"] else (r.get("error") or r.get("stderr") or f"exit code {r['rc']}")
             raise RuntimeError(f"LAMMPS failed in {sid}: {why[:600]}")

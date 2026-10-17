@@ -15,11 +15,11 @@ cd ~/Software && git clone https://github.com/feranick/lammps-translator.git    
 source ~/Software/build123d-translator/.venv/bin/activate                          # shared venv (alias cad)
 pip install -e "$HOME/Software/lammps-translator[mcp,test]"
 lmpt status            # LAMMPS found? version, packages, potentials folders, fea-translator
-pytest -q              # 26 tests: 21 run anywhere, 5 need LAMMPS
+pytest -q              # 27 tests: 22 run anywhere, 5 need LAMMPS (skipped when it is not found)
 lmpt bench             # benchmarks (seconds); slow ones by name: lmpt bench spce_water
 ```
 
-The translator finds LAMMPS as `LMPT_LMP` (a command, e.g. `/usr/bin/lmp` or `lmp_mpi`), else `lmp`, `lmp_mpi`, `lmp_serial` or `lammps` on the PATH. Potential files are looked up in `LMPT_POTENTIALS` (`:`-separated), `LAMMPS_POTENTIALS`, `/usr/share/lammps/potentials`, `/usr/local/share/lammps/potentials`, the `lammps` Python package's `share/lammps/potentials`, and next to the executable (`../share/lammps/potentials`); `lmpt status` lists what it found. Without a system LAMMPS, `pip install "lammps-translator[lammps]"` brings the PyPI wheel (it needs `libmpi.so.12`: `pip install mpich` and its `lib` on `LD_LIBRARY_PATH`).
+The translator finds LAMMPS as `LMPT_LMP` (a command, e.g. `/usr/bin/lmp` or `lmp_mpi`), else `lmp`, `lmp_mpi`, `lmp_serial`, `lmp_stable`, `lmp_openmpi` or `lammps` on the PATH, else in `/usr/bin`, `/usr/local/bin`, `/opt/lammps/bin`, `~/.local/bin`. If none is found, `lmpt status` and every run say so (and what to set). The MCP server runs under a non-interactive ssh shell that does not read `~/.bashrc`: put variables in the ssh command (`env LMPT_LMP=... lmpt-mcp`). Potential files are looked up in `LMPT_POTENTIALS` (`:`-separated), `LAMMPS_POTENTIALS`, `/usr/share/lammps/potentials`, `/usr/local/share/lammps/potentials`, the `lammps` Python package's `share/lammps/potentials`, and next to the executable (`../share/lammps/potentials`); `lmpt status` lists what it found. Without a system LAMMPS, `pip install "lammps-translator[lammps]"` brings the PyPI wheel (it needs `libmpi.so.12`: `pip install mpich` and its `lib` on `LD_LIBRARY_PATH`).
 
 ## Use
 
@@ -150,6 +150,7 @@ tests/test_lmpt.py    examples/studies.json    CLAUDE.md (session context)
 
 | version | changes |
 |---|---|
+| 2026.10.16.2 | LAMMPS discovery: also `lmp_stable`, `lmp_openmpi` and /usr/bin, /usr/local/bin, /opt/lammps/bin, ~/.local/bin; `LMPT_LMP` with `~`; a missing LAMMPS stops the study with what to set (it was reported as 'no log'), and a run that writes no log reports LAMMPS's own error. 27 tests. |
 | 2026.10.16.1 | First version: lattices (11 kinds, orient, substitution), packed molecules (SPC/E, TIP3P, methane UA, custom), data files; EAM/ADP/Tersoff/SW/MEAM/AIREBO/SNAP files and LJ/Morse/Buckingham + Coulomb (Ewald, PPPM); force fields with harmonic bonds/angles, OPLS dihedrals, SHAKE; stages energy, minimize, nve/nvt/npt (RDF, MSD), elastic, eos, vacancy, surface, thermal_expansion; reference implementation; 10 benchmarks; feat_material; MCP server with pending runs, progress and ETA. Tested with LAMMPS 22 Jul 2025 (PyPI wheel, aarch64): 26 tests, 8 default benchmarks pass. |
 
 Author: Nicola Ferralis <ferralis@generalflash.com>
