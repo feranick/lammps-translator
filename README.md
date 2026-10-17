@@ -16,7 +16,7 @@ source ~/Software/build123d-translator/.venv/bin/activate                       
 pip install -e "$HOME/Software/lammps-translator[mcp,test]"
 lmpt status            # LAMMPS found? version, packages, potentials folders, fea-translator
 pytest -q              # 27 tests: 22 run anywhere, 5 need LAMMPS (skipped when it is not found)
-lmpt bench             # benchmarks (seconds); slow ones by name: lmpt bench spce_water
+lmpt bench             # benchmarks (~17 s); slow ones by name: lmpt bench spce_water (~9 min, run it from the shell)
 ```
 
 The translator finds LAMMPS as `LMPT_LMP` (a command, e.g. `/usr/bin/lmp` or `lmp_mpi`), else `lmp`, `lmp_mpi`, `lmp_serial`, `lmp_stable`, `lmp_openmpi` or `lammps` on the PATH, else in `/usr/bin`, `/usr/local/bin`, `/opt/lammps/bin`, `~/.local/bin`. If none is found, `lmpt status` and every run say so (and what to set). The MCP server runs under a non-interactive ssh shell that does not read `~/.bashrc`: put variables in the ssh command (`env LMPT_LMP=... lmpt-mcp`). Potential files are looked up in `LMPT_POTENTIALS` (`:`-separated), `LAMMPS_POTENTIALS`, `/usr/share/lammps/potentials`, `/usr/local/share/lammps/potentials`, the `lammps` Python package's `share/lammps/potentials`, and next to the executable (`../share/lammps/potentials`); `lmpt status` lists what it found. Without a system LAMMPS, `pip install "lammps-translator[lammps]"` brings the PyPI wheel (it needs `libmpi.so.12`: `pip install mpich` and its `lib` on `LD_LIBRARY_PATH`).
@@ -83,7 +83,7 @@ Per stage under its name (default: its kind; repeats get `_2`), plus `structure`
 - **MD**: mean temperature and pressure against the targets (warnings), NVE energy drift (warning above 1e-3, unreliable above 1e-2 eV/atom/ps), errors from 5 block averages.
 - Any LAMMPS `ERROR` stops the study with the message and the stage it came from.
 
-**Benchmarks** (`lmpt bench`; results here with LAMMPS 22 Jul 2025 update 4, the PyPI wheel on aarch64 Linux; to rerun with 4 Jul 2026 on the servers):
+**Benchmarks** (`lmpt bench`; LAMMPS 4 Jul 2026 on carbonio (Debian build), 2026-10-16; identical to 22 Jul 2025 (PyPI wheel, aarch64) except where noted; all default cases in 17 s):
 
 | case | reference | tolerance | result |
 |---|---|---|---|
@@ -93,12 +93,12 @@ Per stage under its name (default: its kind; repeats get `_2`), plus `structure`
 | cauchy_mgo | Buckingham + Ewald at P = 0: C12 = C44; B(eos) = B(elastic) | 1e-4 / 1 % | pass (2.3e-6, 2.6e-5) |
 | eam_cu_foiles | Cu_u3 (Foiles, Baskes, Daw 1986): a 3.615, E_coh 3.54, B 138 GPa, E_vac 1.28 eV, γ(100) 1.28 J/m² | 0.1–2 % | pass (≤ 0.6 %) |
 | tersoff_si | Si.tersoff (Tersoff 1988, Si(B)): a 5.432, E_coh 4.63, B 98; C11 121, C12 86, C44 10 GPa (relaxed) | 0.1–5 % | pass (C44 10.3: 3 %) |
-| equipartition_lj | LJ fcc at 4 K: ⟨pe⟩ − pe₀ = (3/2) k T (N−1)/N | 3 % | pass (0.23 %) |
+| equipartition_lj | LJ fcc at 4 K: ⟨pe⟩ − pe₀ = (3/2) k T (N−1)/N | 3 % | pass (0.04 %; 0.23 % with 22 Jul 2025: a different random trajectory) |
 | nve_conservation | LJ fcc 40 K, NVE: drift | 1e-5 eV/atom/ps | pass (1e-8) |
-| spce_water (slow) | SPC/E 298 K, 1 atm: ρ 0.998 g/cm³, U −46.7 kJ/mol (no polarization correction), O–O peak 2.75 Å | 1 % / 2 % / 3 % | to run (a shorter run here: ρ 0.999 ± 0.003, U −46.78 ± 0.06, peak 2.725) |
-| chain_feat_cantilever | lmpt Cu elastic → `feat_material` → fea-translator cantilever: tip = F L³/(3 E I) | 2 % | skipped here (no fea-translator); via the two MCP servers: 1.2786 vs 1.2832 mm (0.36 %) |
+| spce_water (slow) | SPC/E 298 K, 1 atm: ρ 0.998 g/cm³, U −46.7 kJ/mol (no polarization correction), O–O peak 2.75 Å | 1 % / 2 % / 3 % | pass (ρ 0.9972: 0.08 %; U −46.60 kJ/mol: 0.22 %; peak 2.725 Å: 0.9 %, the 0.05 Å bin centre; 535 s on carbonio) |
+| chain_feat_cantilever | lmpt Cu elastic → `feat_material` → fea-translator cantilever: tip = F L³/(3 E I) | 2 % | pass (1.2786 vs 1.2832 mm: 0.36 %; fea-translator 2026.10.16.9 in the same venv) |
 
-**Assumptions about LAMMPS** (each with what catches it; confirmed with 22 Jul 2025, to confirm with 4 Jul 2026):
+**Assumptions about LAMMPS** (each with what catches it; all confirmed with 22 Jul 2025 and 4 Jul 2026: 27 tests and the benchmarks pass on both):
 
 1. **Tail corrections are not −dE/dV.** LAMMPS's tail pressure is the virial correction, not the volume derivative of its tail energy, so `fix box/relax` with `pair_modify tail yes` stalls ("linesearch alpha is zero"). Validation refuses box relaxation with tail corrections. → test `test_validation_messages`.
 2. **EAM files are read line by line.** After the last value of a block, the rest of the line is discarded (NiO.eam.fs has 12000 values per 10000-point block). The reference reads the same way. → reference check (it was off by 0.009 eV/atom before).
@@ -150,7 +150,7 @@ tests/test_lmpt.py    examples/studies.json    CLAUDE.md (session context)
 
 | version | changes |
 |---|---|
-| 2026.10.16.2 | LAMMPS discovery: also `lmp_stable`, `lmp_openmpi` and /usr/bin, /usr/local/bin, /opt/lammps/bin, ~/.local/bin; `LMPT_LMP` with `~`; a missing LAMMPS stops the study with what to set (it was reported as 'no log'), and a run that writes no log reports LAMMPS's own error. 27 tests. |
+| 2026.10.16.2 | LAMMPS discovery: also `lmp_stable`, `lmp_openmpi` and /usr/bin, /usr/local/bin, /opt/lammps/bin, ~/.local/bin; `LMPT_LMP` with `~`; a missing LAMMPS stops the study with what to set (it was reported as 'no log'), and a run that writes no log reports LAMMPS's own error. 27 tests. Server results (LAMMPS 4 Jul 2026, carbonio): 27 tests, 9/9 benchmarks pass (with the fea-translator chain). |
 | 2026.10.16.1 | First version: lattices (11 kinds, orient, substitution), packed molecules (SPC/E, TIP3P, methane UA, custom), data files; EAM/ADP/Tersoff/SW/MEAM/AIREBO/SNAP files and LJ/Morse/Buckingham + Coulomb (Ewald, PPPM); force fields with harmonic bonds/angles, OPLS dihedrals, SHAKE; stages energy, minimize, nve/nvt/npt (RDF, MSD), elastic, eos, vacancy, surface, thermal_expansion; reference implementation; 10 benchmarks; feat_material; MCP server with pending runs, progress and ETA. Tested with LAMMPS 22 Jul 2025 (PyPI wheel, aarch64): 26 tests, 8 default benchmarks pass. |
 
 Author: Nicola Ferralis <ferralis@generalflash.com>
