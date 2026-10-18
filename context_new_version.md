@@ -53,6 +53,7 @@ A deterministic **translator + checker** for LLMs: the LLM writes a structured s
 
 ## State
 
+- carbonio, 2026.10.18.3, SLURM: madelung_nacl job 5515 pass; NVT 2 ranks job 5516: 2 cores, binding default, reliable, T 39.8 K; jobs/--active worked. mochi, 2026.10.18.3: madelung_nacl job 2482 pass; NVT 9 ranks job 2483: 9 cores, 18 hwthreads, binding default, reliable, 12.8 s (the allocation-overload is fixed). Still to do: two requests from two server processes queueing, MCP reconnect collecting a running job.
 - 2026.10.18.3: `lmpt bench --queue`. carbonio (12 CPUs): madelung_nacl passed with 2026.10.18.2, but ran locally: bin/run sources config/env after the command line, so its LMPT_SLURM_MIN_MINUTES=1 beat the inline 0. SLURM path still to confirm on carbonio and mochi.
 - 2026.10.18.2: first mochi SLURM run failed in mpirun ('allocation-overload', Open MPI 5/PRRTE: ranks bound to cores, fewer cores than ranks in the allocation; mochi: 40 CPUs, LMPT_PROCS 9). Fix: --hint=nomultithread in job.sh, and a binding fallback (lammps.mpi_plan). To rerun on mochi.
 - 2026.10.18.1: SLURM execution per llm-translators docs/EXECUTION.md (executor.py; `lmpt run-study`, `jobs`, `cancel`; states; `executor` in status). Here: 45 tests pass (18 SLURM tests with tests/fakeslurm.py, real LAMMPS 22 Jul 2025 inside the fake jobs). To do on mochi: `LMPT_EXECUTOR=slurm` with `madelung_nacl` and a short NVT run; two requests from two processes queue rather than oversubscribe; close the MCP connection while a job runs, reconnect, collect.
