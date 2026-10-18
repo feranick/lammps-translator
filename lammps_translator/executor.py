@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.18.1
+Version: 2026.10.18.2
 
 Settings (environment): LMPT_EXECUTOR local | slurm (local); LMPT_SLURM_MIN_MINUTES (1): studies estimated
 shorter run locally; LMPT_SLURM_ARGS: extra sbatch arguments; LMPT_PROCS (MPI ranks, --ntasks); LMPT_TIMEOUT
@@ -133,6 +133,13 @@ def _atomic_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
+def _whole_cores() -> bool:
+    """One physical core per rank (--hint=nomultithread), unless LMPT_SLURM_ARGS says otherwise. LMPT_PROCS is
+    sized in physical cores (llmt tune), and Open MPI binds ranks to cores."""
+    a = os.environ.get("LMPT_SLURM_ARGS", "")
+    return not any(k in a for k in ("--hint", "--threads-per-core", "--ntasks-per-core", "--cpus-per-task"))
+
+
 def write_job(request: Path, name: str, procs: int) -> Path:
     d = request / name
     d.mkdir(parents=True, exist_ok=True)
@@ -141,6 +148,7 @@ def write_job(request: Path, name: str, procs: int) -> Path:
              f"#SBATCH --chdir={d}",
              f"#SBATCH --output={d / 'job.log'}",
              f"#SBATCH --ntasks={procs}",
+             *(["#SBATCH --hint=nomultithread"] if _whole_cores() else []),
              f"#SBATCH --time={time_limit_min()}",
              "#SBATCH --export=ALL",
              f"exec {shlex.quote(sys.executable)} -m lammps_translator.cli run-study {shlex.quote(str(request))} "

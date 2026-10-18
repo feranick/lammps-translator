@@ -1,4 +1,4 @@
-"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.18.1
+"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.18.2
 They run anywhere; with LAMMPS (set LMPT_LMP, or lmp on the PATH) the jobs also compute real results."""
 import json
 import os
@@ -65,6 +65,7 @@ def test_status_key_and_job_file(slurm, monkeypatch):
     job = (req / "lj" / "job.sh").read_text()
     assert f"#SBATCH --job-name=lmpt:{req.name}:lj" in job and "#SBATCH --ntasks=3" in job
     assert "#SBATCH --time=370" in job and "#SBATCH --export=ALL" in job and "run-study" in job
+    assert "#SBATCH --hint=nomultithread" in job
     info = json.loads((req / "lj" / "job.json").read_text())
     assert info["executor"] == "slurm" and info["procs"] == 3 and info["time_min"] == 370
     assert r["pending"] == ["lj"] and r["progress"]["lj"]["state"] == "queued"
@@ -206,3 +207,18 @@ def test_local_cancel(tmp_path, monkeypatch):
     assert c["cancel"]["md"]["cancelled"]
     out = api.status(r["request"], 60)
     assert out["done"] and out["studies"]["md"]["state"] == "cancelled"
+
+
+def test_mpi_binding_fits_the_allocation(monkeypatch):
+    from lammps_translator import lammps as L
+    monkeypatch.delenv("LMPT_MPIRUN", raising=False)
+    monkeypatch.setattr(L, "mpi_flavor", lambda launcher: "openmpi")
+    monkeypatch.setattr(L, "cpu_topology", lambda: {"hwthreads": 10, "cores": 5})     # SLURM gave 9 hw threads
+    assert L.mpi_plan(4)["launcher"] == ["mpirun", "-np", "4"]
+    p = L.mpi_plan(9)
+    assert p["launcher"] == ["mpirun", "--bind-to", "hwthread", "-np", "9"] and "share cores" in p["note"]
+    assert L.mpi_plan(12)["launcher"] == ["mpirun", "--bind-to", "none", "--oversubscribe", "-np", "12"]
+    monkeypatch.setenv("LMPT_MPIRUN", "mpirun --bind-to core:overload-allowed")
+    assert L.mpi_plan(9)["launcher"] == ["mpirun", "--bind-to", "core:overload-allowed", "-np", "9"]
+    monkeypatch.setenv("LMPT_SLURM_ARGS", "--threads-per-core=2")
+    assert not X._whole_cores()

@@ -1,5 +1,5 @@
 """lammps.py — the only module that runs LAMMPS: finds the executable, reads its capabilities, runs inputs.
-Version: 2026.10.18.1
+Version: 2026.10.18.2
 
 Executable: LMPT_LMP (a command, e.g. 'lmp', '/opt/lammps/bin/lmp_mpi' or 'mpirun -np 4 lmp'), else the first of
 lmp, lmp_mpi, lmp_serial, lmp_stable, lmp_openmpi, lammps on the PATH, else the same names in /usr/bin,
@@ -97,6 +97,68 @@ def missing_styles(needed: dict) -> list[str]:
     return out
 
 
+def cpu_topology() -> dict:
+    """CPUs this process may use (its affinity: the SLURM allocation inside a job) and the physical cores they
+    belong to."""
+    try:
+        cpus = sorted(os.sched_getaffinity(0))
+    except AttributeError:
+        cpus = list(range(os.cpu_count() or 1))
+    cores = set()
+    for c in cpus:
+        base = Path(f"/sys/devices/system/cpu/cpu{c}/topology")
+        try:
+            cores.add((base.joinpath("physical_package_id").read_text().strip(), base.joinpath("core_id").read_text().strip()))
+        except OSError:
+            cores.add(("?", str(c)))
+    return {"hwthreads": len(cpus), "cores": len(cores)}
+
+
+@lru_cache(maxsize=4)
+def mpi_flavor(launcher: str) -> str:
+    r = _info_text([launcher, "--version"])
+    t = r.lower()
+    if "open mpi" in t or "open-mpi" in t or "prrte" in t or "prterun" in t:
+        return "openmpi"
+    if "hydra" in t or "mpich" in t or "intel(r) mpi" in t:
+        return "mpich"
+    return "unknown"
+
+
+def _info_text(cmd: list[str]) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return r.stdout + r.stderr
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def mpi_plan(procs: int) -> dict:
+    """The MPI launch for procs ranks: LMPT_MPIRUN (mpirun) -np procs, with a binding that fits the CPUs we have.
+    Open MPI binds each rank to a core by default and refuses ('allocation-overload') when ranks outnumber the
+    cores, as in a SLURM allocation of hardware threads: then bind to hardware threads, or not at all."""
+    env = os.environ.get("LMPT_MPIRUN", "mpirun")
+    launcher = shlex.split(env)
+    topo = cpu_topology()
+    out = {"launcher": [*launcher, "-np", str(procs)], "binding": "default", **topo}
+    user_set = any(a.startswith(("--bind-to", "-bind-to", "--map-by", "-map-by", "--oversubscribe")) for a in launcher)
+    if procs <= topo["cores"] or user_set:
+        return out
+    flavor = mpi_flavor(launcher[0])
+    out["mpi"] = flavor
+    if flavor == "openmpi":
+        extra = ["--bind-to", "hwthread"] if procs <= topo["hwthreads"] else ["--bind-to", "none", "--oversubscribe"]
+    elif flavor == "mpich":
+        extra = ["-bind-to", "hwthread"] if procs <= topo["hwthreads"] else []
+    else:
+        extra = []
+    out["launcher"] = [*launcher, *extra, "-np", str(procs)]
+    out["binding"] = " ".join(extra) or "default"
+    out["note"] = (f"{procs} ranks on {topo['cores']} physical cores ({topo['hwthreads']} hardware threads): ranks "
+                   "share cores, which is slower; with SLURM, ask for whole cores (the job's --hint=nomultithread)")
+    return out
+
+
 def run(input_name: str, log_name: str, cwd: Path, procs: int = 1, timeout: float = 3600.0) -> dict:
     """Runs LAMMPS on cwd/input_name, writing cwd/log_name. Returns rc, seconds, stderr tail."""
     cmd = find_lmp()
@@ -104,8 +166,7 @@ def run(input_name: str, log_name: str, cwd: Path, procs: int = 1, timeout: floa
         return {"rc": -1, "error": not_found(), "seconds": 0.0}
     full = [*cmd, "-in", input_name, "-log", log_name, "-screen", "none"]
     if procs > 1:
-        mpirun = shlex.split(os.environ.get("LMPT_MPIRUN", "mpirun"))
-        full = [*mpirun, "-np", str(procs), *full]
+        full = [*mpi_plan(procs)["launcher"], *full]
     env = dict(os.environ)
     env.setdefault("OMP_NUM_THREADS", "1")
     t0 = time.perf_counter()

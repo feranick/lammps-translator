@@ -1,5 +1,5 @@
 """runner.py — one study end to end: build, write inputs stage by stage, run LAMMPS, read, analyse, check.
-Version: 2026.10.18.1
+Version: 2026.10.18.2
 
 Folder layout (<request>/<study>/):
     initial.data, potentials/, 00_setup/ (in.lammps, log.lammps, forces0.dump), 01_<stage>/ ..., run_all.sh,
@@ -169,6 +169,14 @@ class Study:
         res["units"] = self.units
         info = lmp_info()
         res["lammps"] = {"version": info.get("version"), "exe": info.get("exe"), "procs": self.procs}
+        if self.procs > 1:
+            from .lammps import mpi_plan
+            mp_ = mpi_plan(self.procs)
+            res["lammps"]["mpi"] = {k: v for k, v in mp_.items() if k != "launcher"} | {"launch": " ".join(mp_["launcher"])}
+            if mp_.get("note"):
+                self.warnings.append(mp_["note"])
+            if os.environ.get("SLURM_JOB_ID"):
+                res["lammps"]["slurm_job"] = os.environ["SLURM_JOB_ID"]
         plan = [{"id": "00_setup", "kind": "setup", "steps": 0}]
         for i, (sd, nm) in enumerate(zip(st["stages"], self.names)):
             steps = int(sd.get("steps", 0)) if sd["kind"] in MD_KINDS else (
