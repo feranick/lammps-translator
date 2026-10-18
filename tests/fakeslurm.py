@@ -1,4 +1,4 @@
-"""fakeslurm.py — stand-ins for sbatch, squeue, scancel, sacct and sinfo (tests only). Version: 2026.10.18.3
+"""fakeslurm.py — stand-ins for sbatch, squeue, scancel, sacct and sinfo (tests only). Version: 2026.10.18.5
 
 State in $FAKE_SLURM/state.json. sbatch starts job.sh in the background (or holds it PENDING when the file
 $FAKE_SLURM/hold exists, and fails when $FAKE_SLURM/fail_submit exists); squeue reports RUNNING while the process
@@ -77,7 +77,7 @@ def squeue(args):
     fmt = args[args.index("-o") + 1] if "-o" in args else "%i"
     only = args[args.index("-t") + 1] if "-t" in args else None
     s = load()
-    for jid, job in sorted(s["jobs"].items()):
+    for jid, job in sorted(s["jobs"].items(), reverse=True):     # like squeue: not in scheduling order
         st = current(job)
         if st not in ("PENDING", "RUNNING") or job.get("vanished"):
             continue
@@ -85,7 +85,7 @@ def squeue(args):
             continue
         el = int(time.time() - job.get("start", time.time())) if st == "RUNNING" else 0
         val = {"i": jid, "T": st, "r": "Resources" if st == "PENDING" else "None", "S": "N/A",
-               "M": f"{el // 60}:{el % 60:02d}", "j": job["name"], "C": str(job["cpus"])}
+               "M": f"{el // 60}:{el % 60:02d}", "j": job["name"], "C": str(job["cpus"]), "Q": "1000"}
         line = fmt
         for k, v in val.items():
             line = line.replace("%" + k, v)

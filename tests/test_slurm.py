@@ -1,4 +1,4 @@
-"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.18.3
+"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.18.5
 They run anywhere; with LAMMPS (set LMPT_LMP, or lmp on the PATH) the jobs also compute real results."""
 import json
 import os
@@ -65,7 +65,7 @@ def test_status_key_and_job_file(slurm, monkeypatch):
     job = (req / "lj" / "job.sh").read_text()
     assert f"#SBATCH --job-name=lmpt:{req.name}:lj" in job and "#SBATCH --ntasks=3" in job
     assert "#SBATCH --time=370" in job and "#SBATCH --export=ALL" in job and "run-study" in job
-    assert "#SBATCH --hint=nomultithread" in job
+    assert "#SBATCH --ntasks-per-core=1" in job
     info = json.loads((req / "lj" / "job.json").read_text())
     assert info["executor"] == "slurm" and info["procs"] == 3 and info["time_min"] == 370
     assert r["pending"] == ["lj"] and r["progress"]["lj"]["state"] == "queued"
@@ -81,6 +81,9 @@ def test_submit_run_and_collect_from_a_new_process(slurm):
     res = out["studies"]["lj"]
     if HAVE_LAMMPS:
         assert res["ok"] and res["checks"]["reference"]["pass"], res.get("why")
+        ex = res["execution"]
+        jid = json.loads((Path(r["request"]) / "lj" / "job.json").read_text())["job_id"]
+        assert ex["executor"] == "slurm" and ex["slurm_job"] == jid and ex["procs_requested"] == 1 and ex["mpi"] is None
     else:
         assert res["ok"] is False and "LAMMPS not found" in res["why"]
     d = Path(r["request"]) / "lj"
@@ -141,6 +144,7 @@ def test_failure_states(slurm, sacct, log, state):
     out = api.status(r["request"])
     res = out["studies"]["lj"]
     assert out["done"] and res["state"] == state and res["ok"] is False and res["why"], res
+    assert res["execution"] == {"executor": "slurm", "slurm_job": jid}
     if state == "failed":
         assert "log_tail" in res or "SLURM state" in res["why"]
     if state == "timed_out":
@@ -168,7 +172,7 @@ def test_run_study_cli_by_hand(slurm, tmp_path):
                        capture_output=True, text=True, timeout=120, env=os.environ)
     assert p.returncode == 0, p.stderr
     res = json.loads((Path(r["request"]) / "lj" / "lj.json").read_text())
-    assert "ok" in res
+    assert "ok" in res and res["execution"]["executor"] == "by hand"
 
 
 @pytest.mark.skipif(not HAVE_LAMMPS, reason="needs LAMMPS")
@@ -230,3 +234,59 @@ def test_bench_queue_flag_overrides_min_minutes(slurm, monkeypatch):
     monkeypatch.setenv("LMPT_SLURM_MIN_MINUTES", "1")
     out = api.bench(["madelung_nacl"], wait=120, queue=True)
     assert out["passed"] == ["madelung_nacl"] and out["cases"]["madelung_nacl"]["job_id"]
+
+
+def test_ahead_follows_priority_then_job_id(slurm):
+    (slurm / "hold").write_text("")
+    r = api.run({"a": LJ, "b": LJ, "c": LJ}, wait=0)
+    ahead = {n: r["progress"][n]["ahead"] for n in "abc"}
+    assert ahead == {"a": 0, "b": 1, "c": 2}, ahead
+
+
+def test_job_limits_time_estimate_and_memory(slurm, monkeypatch):
+    (slurm / "hold").write_text("")
+    monkeypatch.setenv("LMPT_PROCS", "3")
+    r = api.run({"lj": LJ}, wait=0)
+    d = Path(r["request"]) / "lj"
+    job, info = (d / "job.sh").read_text(), json.loads((d / "job.json").read_text())
+    assert "#SBATCH --time=370" in job and info["time_from"] == "timeout" and info["timeout_s"] == 360 * 60
+    assert "#SBATCH --mem=2048M" in job and info["mem"] == "2048M" and info["natoms"] == 108     # auto, the floor
+    monkeypatch.setenv("LMPT_SLURM_TIME", "estimate")
+    monkeypatch.setenv("LMPT_SLURM_MEM", "8G")
+    r = api.run({"lj": LJ}, wait=0)
+    d = Path(r["request"]) / "lj"
+    job, info = (d / "job.sh").read_text(), json.loads((d / "job.json").read_text())
+    assert "#SBATCH --time=20" in job and info["time_from"] == "estimate" and info["timeout_s"] == 600
+    assert "#SBATCH --mem=8G" in job
+    s = api.tool_status()["executor"]
+    assert s["time"] == "estimate" and s["mem"] == "8G" and s["time_factor"] == 3.0
+    big = {**LJ, "stages": [{"kind": "nvt", "T": 30, "steps": 50_000_000}]}
+    r = api.run({"big": big}, wait=0)
+    info = json.loads((Path(r["request"]) / "big" / "job.json").read_text())
+    assert info["time_min"] == min(370, int(__import__("math").ceil(3 * info["estimate_min"])) + 10) > 20
+    monkeypatch.setenv("LMPT_SLURM_ARGS", "--mem=4G --nice=10")
+    monkeypatch.setenv("LMPT_SLURM_MEM", "auto")
+    r = api.run({"lj": LJ}, wait=0)
+    d = Path(r["request"]) / "lj"
+    assert "--mem" not in (d / "job.sh").read_text()
+    assert json.loads((d / "job.json").read_text())["command"][2:4] == ["--mem=4G", "--nice=10"]
+    monkeypatch.setenv("LMPT_SLURM_ARGS", "")
+    monkeypatch.setenv("LMPT_SLURM_MEM", "none")
+    r = api.run({"lj": LJ}, wait=0)
+    assert "--mem" not in (Path(r["request"]) / "lj" / "job.sh").read_text()
+
+
+@pytest.mark.skipif(not HAVE_LAMMPS, reason="needs LAMMPS")
+def test_estimate_limit_timeout_says_what_to_change(slurm):
+    (slurm / "hold").write_text("")
+    st = {**LJ, "stages": [{"kind": "nvt", "T": 30, "steps": 50_000_000}]}
+    r = api.run({"md": st}, wait=0)
+    d = Path(r["request"]) / "md"
+    info = json.loads((d / "job.json").read_text())
+    info.update({"time_from": "estimate", "timeout_s": 5, "time_min": 15})
+    (d / "job.json").write_text(json.dumps(info))
+    p = subprocess.run([sys.executable, "-m", "lammps_translator.cli", "run-study", r["request"], "md"],
+                       capture_output=True, text=True, timeout=120, env=os.environ)
+    assert p.returncode == 0, p.stderr
+    res = json.loads((d / "md.json").read_text())
+    assert res["ok"] is False and res["state"] == "timed_out" and "LMPT_SLURM_TIME=timeout" in res["why"]

@@ -1,5 +1,5 @@
 """runner.py — one study end to end: build, write inputs stage by stage, run LAMMPS, read, analyse, check.
-Version: 2026.10.18.3
+Version: 2026.10.18.5
 
 Folder layout (<request>/<study>/):
     initial.data, potentials/, 00_setup/ (in.lammps, log.lammps, forces0.dump), 01_<stage>/ ..., run_all.sh,
@@ -90,6 +90,8 @@ class Study:
         self.t_start = time.time()
         self.lmp_seconds = 0.0
         self.res: dict = {"ok": False, "name": name, "translator": __version__}
+        self.res["execution"] = {"executor": "local", "slurm_job": None, "procs_requested": procs, "procs_used": procs,
+                                 "mpi": None}
 
     # ----------------------------------------------------------------------------- preparation
     def prepare(self):
@@ -169,12 +171,13 @@ class Study:
         res["units"] = self.units
         info = lmp_info()
         res["lammps"] = {"version": info.get("version"), "exe": info.get("exe"), "procs": self.procs}
-        if os.environ.get("SLURM_JOB_ID"):
-            res["lammps"]["slurm_job"] = os.environ["SLURM_JOB_ID"]
         if self.procs > 1:
             from .lammps import mpi_plan
             mp_ = mpi_plan(self.procs)
-            res["lammps"]["mpi"] = {k: v for k, v in mp_.items() if k != "launcher"} | {"launch": " ".join(mp_["launcher"])}
+            res["execution"]["mpi"] = {"launch": " ".join(mp_["launcher"]),
+                                       "binding": mp_["binding"].replace("--bind-to ", "").split()[0]
+                                       if mp_["binding"] != "default" else "default",
+                                       "cores": mp_["cores"], "hwthreads": mp_["hwthreads"]}
             if mp_.get("note"):
                 self.warnings.append(mp_["note"])
 
@@ -552,7 +555,10 @@ def finish(res: dict, st: Study, folder: Path, name: str, study: dict) -> dict:
     return _jsonable(res)
 
 
-def run_study(name: str, study: dict, folder: Path, timeout: float = 3600.0, procs: int | None = None) -> dict:
+def run_study(name: str, study: dict, folder: Path, timeout: float = 3600.0, procs: int | None = None,
+              executor: str = "local") -> dict:
+    """One study end to end. executor: local (a pool worker or the benchmarks here), slurm (inside a job),
+    'by hand' (lmpt run-study outside SLURM); it goes into the result's run record ('execution')."""
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     v = validate_study(study)
@@ -562,6 +568,7 @@ def run_study(name: str, study: dict, folder: Path, timeout: float = 3600.0, pro
         return out
     np_ = procs or int(study.get("procs", os.environ.get("LMPT_PROCS", "1")))
     st = Study(name, study, folder, timeout, np_)
+    st.res["execution"].update({"executor": executor, "slurm_job": os.environ.get("SLURM_JOB_ID")})
     st.warnings += v["warnings"]
     res = st.res
     try:

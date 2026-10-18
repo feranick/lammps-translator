@@ -1,5 +1,5 @@
 """lammps.py — the only module that runs LAMMPS: finds the executable, reads its capabilities, runs inputs.
-Version: 2026.10.18.3
+Version: 2026.10.18.5
 
 Executable: LMPT_LMP (a command, e.g. 'lmp', '/opt/lammps/bin/lmp_mpi' or 'mpirun -np 4 lmp'), else the first of
 lmp, lmp_mpi, lmp_serial, lmp_stable, lmp_openmpi, lammps on the PATH, else the same names in /usr/bin,
@@ -155,7 +155,7 @@ def mpi_plan(procs: int) -> dict:
     out["launcher"] = [*launcher, *extra, "-np", str(procs)]
     out["binding"] = " ".join(extra) or "default"
     out["note"] = (f"{procs} ranks on {topo['cores']} physical cores ({topo['hwthreads']} hardware threads): ranks "
-                   "share cores, which is slower; with SLURM, ask for whole cores (the job's --hint=nomultithread)")
+                   "share cores, which is slower; with SLURM, ask for whole cores (the job's --ntasks-per-core=1)")
     return out
 
 
@@ -190,7 +190,7 @@ def run(input_name: str, log_name: str, cwd: Path, procs: int = 1, timeout: floa
                 out, err = p.communicate()
                 rc = -9
                 err = (err or "") + ("\ncancelled" if cancelled else f"\ntimed out after {timeout:g} s")
-    msg = (err or "")[-2000:] + (out or "")[-1000:]
+    msg = ((err or "")[-2000:] + (out or "")[-1000:]).replace("\x00", "")
     if rc == -9 and not cancelled:
         msg = f"timed out after {timeout:g} s (LMPT_TIMEOUT)"
     res = {"rc": rc, "seconds": round(time.perf_counter() - t0, 3), "stderr": msg.strip(), "command": " ".join(full)}

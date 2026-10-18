@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.18.3
+Version: 2026.10.18.5
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks (builds the structures, finds potential files; no LAMMPS run)
@@ -209,7 +209,7 @@ def start(studies: dict, prefix: str = "run", extra: dict | None = None) -> Path
     "queue": true) or the local worker pool."""
     folder = _request_dir(prefix)
     (folder / "studies.json").write_text(json.dumps(studies, indent=1))
-    invalid, jobs, where, est = {}, [], {}, {}
+    invalid, jobs, where, est, natoms = {}, [], {}, {}, {}
     if not isinstance(studies, dict):
         studies = {}
     for n, st in studies.items():
@@ -217,7 +217,9 @@ def start(studies: dict, prefix: str = "run", extra: dict | None = None) -> Path
         if not v["ok"]:
             invalid[n] = {"ok": False, "why": "invalid study", "errors": v["errors"], "warnings": v["warnings"]}
             continue
-        est[n] = X.estimate_minutes(st) if X.kind() == "slurm" else None
+        e = X.estimate(st) if X.kind() == "slurm" else {"minutes": None, "natoms": None}
+        est[n] = e["minutes"]
+        natoms[n] = e["natoms"]
         where[n] = "slurm" if X.goes_to_slurm(st, est[n]) else "local"
         if where[n] == "local":
             jobs.append({"name": n, "study": st, "folder": str(folder)})
@@ -227,7 +229,7 @@ def start(studies: dict, prefix: str = "run", extra: dict | None = None) -> Path
         "studies": {n: studies[n] for n in names}, "translator": __version__, **(extra or {})})
     for n in names:
         if where[n] == "slurm":
-            X.submit(folder, n, studies[n], est[n])
+            X.submit(folder, n, studies[n], est[n], natoms[n])
     if jobs:
         _POOL.submit(folder, jobs)
     return folder
@@ -261,7 +263,19 @@ def run_one(request: str, name: str) -> int:
     meta = json.loads((folder / "request.json").read_text())
     study = meta["studies"][name]
     procs = int(os.environ.get("SLURM_NTASKS") or study.get("procs") or os.environ.get("LMPT_PROCS", "1"))
-    run_study(name, study, folder / name, X.timeout_s(), procs)
+    try:
+        job = json.loads((folder / name / "job.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        job = {}
+    timeout = float(job.get("timeout_s") or X.timeout_s())
+    res = run_study(name, study, folder / name, timeout, procs,
+                    executor="slurm" if os.environ.get("SLURM_JOB_ID") else "by hand")
+    if not res.get("ok") and "timed out" in str(res.get("why", "")):
+        res["state"] = "timed_out"
+        if job.get("time_from") == "estimate":
+            res["why"] += (f" — the job's limit came from the estimate ({job.get('estimate_min')} min x "
+                           f"LMPT_SLURM_TIME_FACTOR): rerun with LMPT_SLURM_TIME=timeout or a larger factor")
+        X._atomic_json(folder / name / f"{name}.json", res)
     return 0
 
 

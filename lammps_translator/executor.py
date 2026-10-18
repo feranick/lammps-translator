@@ -1,10 +1,19 @@
 """executor.py — where studies run: the local worker pool or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.18.3
+Version: 2026.10.18.5
 
 Settings (environment): LMPT_EXECUTOR local | slurm (local); LMPT_SLURM_MIN_MINUTES (1): studies estimated
 shorter run locally; LMPT_SLURM_ARGS: extra sbatch arguments; LMPT_PROCS (MPI ranks, --ntasks); LMPT_TIMEOUT
-(seconds per study; the job's --time is ceil(timeout/60) + 10 minutes). A study's "queue": true / false forces
-SLURM / local (not with LMPT_EXECUTOR=local).
+(seconds per study). A study's "queue": true / false forces SLURM / local (not with LMPT_EXECUTOR=local).
+
+Job limits:
+  --time   LMPT_SLURM_TIME=timeout (default): ceil(LMPT_TIMEOUT/60) + 10 min. =estimate: max(LMPT_SLURM_TIME_MIN (20),
+           ceil(LMPT_SLURM_TIME_FACTOR (3) x the estimate) + 10) min, at most the former; the study's own timeout is
+           10 min less. Short limits let SLURM backfill short studies around long jobs; a study that outruns its
+           estimate ends timed_out (rerun with LMPT_SLURM_TIME=timeout).
+  --mem    LMPT_SLURM_MEM=auto (default): 1 GB + 256 MB per rank + 4 kB per atom, rounded up to 512 MB, at least
+           2 GB; a size (8G, 8000M) as given; none: SLURM's default (on nodes with CR_Core_Memory and no DefMemPerCPU
+           that is the whole node, and jobs run one at a time). A --mem* in LMPT_SLURM_ARGS wins.
+  --ntasks-per-core=1 (one physical core per rank) unless LMPT_SLURM_ARGS sets the core/thread layout.
 
 One SLURM job per study: <request>/<name>/job.sh (complete, rerunnable with sbatch) and job.json. States come from
 the files and the queue (squeue, then sacct, then job.log), never from in-process handles, so any server process,
@@ -58,10 +67,46 @@ def sbatch_path() -> str | None:
     return shutil.which("sbatch")
 
 
+def time_mode() -> str:
+    return "estimate" if os.environ.get("LMPT_SLURM_TIME", "timeout").strip().lower() == "estimate" else "timeout"
+
+
+def job_time(estimate: float | None) -> tuple[int, str]:
+    """(the job's --time in minutes, how it was chosen)."""
+    full = time_limit_min()
+    if time_mode() == "estimate" and estimate is not None:
+        f = float(os.environ.get("LMPT_SLURM_TIME_FACTOR", "3"))
+        floor = int(os.environ.get("LMPT_SLURM_TIME_MIN", "20"))
+        return min(full, max(floor, int(math.ceil(f * estimate)) + 10)), "estimate"
+    return full, "timeout"
+
+
+def mem_setting() -> str:
+    return os.environ.get("LMPT_SLURM_MEM", "auto").strip() or "auto"
+
+
+def job_mem(procs: int, natoms: int | None) -> str | None:
+    """The job's --mem value, or None (SLURM_ARGS has one, or LMPT_SLURM_MEM=none)."""
+    a = os.environ.get("LMPT_SLURM_ARGS", "")
+    if "--mem" in a:
+        return None
+    m = mem_setting()
+    if m.lower() == "none":
+        return None
+    if m.lower() != "auto":
+        return m
+    mb = 1024 + 256 * procs + 0.004 * (natoms or 100000)
+    mb = max(2048, int(math.ceil(mb / 512.0)) * 512)
+    return f"{mb}M"
+
+
 def status() -> dict:
     out = {"kind": kind(), "sbatch": sbatch_path(), "min_minutes": min_minutes(), "procs": default_procs(),
-           "time_limit_min": time_limit_min(), "slurm_args": os.environ.get("LMPT_SLURM_ARGS", ""),
-           "workers": int(os.environ.get("LMPT_WORKERS", "2"))}
+           "time_limit_min": time_limit_min(), "time": time_mode(), "mem": mem_setting(),
+           "slurm_args": os.environ.get("LMPT_SLURM_ARGS", ""), "workers": int(os.environ.get("LMPT_WORKERS", "2"))}
+    if time_mode() == "estimate":
+        out["time_factor"] = float(os.environ.get("LMPT_SLURM_TIME_FACTOR", "3"))
+        out["time_min_min"] = int(os.environ.get("LMPT_SLURM_TIME_MIN", "20"))
     if out["kind"] == "slurm" and not out["sbatch"]:
         out["error"] = "LMPT_EXECUTOR=slurm but sbatch is not on the PATH: studies will fail to submit"
     return out
@@ -73,14 +118,23 @@ _COST = {"lj": 1.5e-6, "morse": 1.5e-6, "buck": 1.5e-6, "coul": 1.5e-6, "eam": 2
          "vashishta": 5e-6, "adp": 1e-5, "meam": 2e-5, "airebo": 3e-5, "rebo": 2e-5, "snap": 2e-4}
 
 
-def estimate_minutes(study: dict) -> float | None:
+def estimate(study: dict) -> dict:
+    """{'minutes': rough run-time estimate or None, 'natoms': atoms or None}."""
+    try:
+        from .build import build_system
+        n = build_system(study).n
+    except Exception:  # noqa: BLE001
+        return {"minutes": None, "natoms": None}
+    return {"minutes": estimate_minutes(study, n), "natoms": n}
+
+
+def estimate_minutes(study: dict, natoms: int | None = None) -> float | None:
     """A rough upper estimate of the study's run time (one core per rank, ~1 GHz-µs per atom-step costs)."""
     try:
         from .build import build_system
         from .format import molecular
 
-        s = build_system(study)
-        n = s.n
+        n = natoms if natoms is not None else build_system(study).n
         if molecular(study):
             ff = study.get("forcefield") or {}
             c = 2e-6 + (4e-6 if ff.get("coulomb", "long") == "long" else 0.0)
@@ -134,13 +188,13 @@ def _atomic_json(path: Path, obj) -> None:
 
 
 def _whole_cores() -> bool:
-    """One physical core per rank (--hint=nomultithread), unless LMPT_SLURM_ARGS says otherwise. LMPT_PROCS is
+    """One physical core per rank (--ntasks-per-core=1), unless LMPT_SLURM_ARGS says otherwise. LMPT_PROCS is
     sized in physical cores (llmt tune), and Open MPI binds ranks to cores."""
     a = os.environ.get("LMPT_SLURM_ARGS", "")
     return not any(k in a for k in ("--hint", "--threads-per-core", "--ntasks-per-core", "--cpus-per-task"))
 
 
-def write_job(request: Path, name: str, procs: int) -> Path:
+def write_job(request: Path, name: str, procs: int, time_min: int | None = None, mem: str | None = None) -> Path:
     d = request / name
     d.mkdir(parents=True, exist_ok=True)
     lines = ["#!/bin/bash",
@@ -148,8 +202,9 @@ def write_job(request: Path, name: str, procs: int) -> Path:
              f"#SBATCH --chdir={d}",
              f"#SBATCH --output={d / 'job.log'}",
              f"#SBATCH --ntasks={procs}",
-             *(["#SBATCH --hint=nomultithread"] if _whole_cores() else []),
-             f"#SBATCH --time={time_limit_min()}",
+             *(["#SBATCH --ntasks-per-core=1"] if _whole_cores() else []),
+             f"#SBATCH --time={time_min or time_limit_min()}",
+             *([f"#SBATCH --mem={mem}"] if mem else []),
              "#SBATCH --export=ALL",
              f"exec {shlex.quote(sys.executable)} -m lammps_translator.cli run-study {shlex.quote(str(request))} "
              f"{shlex.quote(name)}"]
@@ -159,10 +214,12 @@ def write_job(request: Path, name: str, procs: int) -> Path:
     return p
 
 
-def submit(request: Path, name: str, study: dict, estimate: float | None) -> dict:
+def submit(request: Path, name: str, study: dict, estimate: float | None, natoms: int | None = None) -> dict:
     """Writes job.sh, runs sbatch; job.json on success, else the study's result says why (no local fallback)."""
     procs = study_procs(study)
-    job = write_job(request, name, procs)
+    tmin, how = job_time(estimate)
+    mem = job_mem(procs, natoms)
+    job = write_job(request, name, procs, tmin, mem)
     cmd = ["sbatch", "--parsable", *shlex.split(os.environ.get("LMPT_SLURM_ARGS", "")), str(job)]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=job.parent)
@@ -171,12 +228,14 @@ def submit(request: Path, name: str, study: dict, estimate: float | None) -> dic
     except (OSError, subprocess.TimeoutExpired) as exc:
         ok, msg, r = False, str(exc), None
     if not ok:
-        res = {"ok": False, "name": name, "state": "failed", "why": f"could not submit: {msg[:500] or 'sbatch failed'}"}
+        res = {"ok": False, "name": name, "state": "failed", "why": f"could not submit: {msg[:500] or 'sbatch failed'}",
+               "execution": {"executor": "slurm", "slurm_job": None, "procs_requested": procs}}
         _atomic_json(request / name / f"{name}.json", res)
         return res
     jid = r.stdout.strip().split(";")[0].split()[0]
-    info = {"executor": "slurm", "job_id": jid, "submitted": time.time(), "procs": procs,
-            "time_min": time_limit_min(), "estimate_min": estimate, "command": cmd}
+    info = {"executor": "slurm", "job_id": jid, "submitted": time.time(), "procs": procs, "time_min": tmin,
+            "time_from": how, "timeout_s": (tmin - 10) * 60, "mem": mem, "estimate_min": estimate, "natoms": natoms,
+            "command": cmd}
     _atomic_json(request / name / "job.json", info)
     return info
 
@@ -219,10 +278,21 @@ def queue() -> dict | None:
 
 
 def _ahead(jid: str) -> int | None:
-    rc, out, _ = _run(["squeue", "-h", "-t", "PENDING", "-o", "%i"])
+    """Pending jobs (anyone's) that SLURM will consider first: higher priority, then earlier job id.
+    (squeue's own listing order is not the scheduling order.)"""
+    rc, out, _ = _run(["squeue", "-h", "-t", "PENDING", "-o", "%i|%Q"])
     if rc != 0:
         return None
-    ids = [x.strip() for x in out.splitlines() if x.strip()]
+    jobs = []
+    for ln in out.splitlines():
+        t = ln.strip().split("|")
+        if len(t) == 2 and t[0]:
+            try:
+                jobs.append((-float(t[1]), int(t[0].split("_")[0]), t[0]))
+            except ValueError:
+                continue
+    jobs.sort()
+    ids = [j[2] for j in jobs]
     return ids.index(jid) if jid in ids else None
 
 
@@ -244,6 +314,17 @@ def _tail(path: Path, n: int = 30) -> str:
         return ""
 
 
+def _time_hint(d: Path) -> str:
+    try:
+        j = json.loads((d / "job.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if j.get("time_from") == "estimate":
+        return (f" (a {j.get('time_min')} min limit from the estimate, {j.get('estimate_min')} min: rerun with "
+                "LMPT_SLURM_TIME=timeout or a larger LMPT_SLURM_TIME_FACTOR)")
+    return ""
+
+
 def ended_state(d: Path, jid: str) -> dict:
     """A job that left the queue without a result: what happened."""
     log = d / "job.log"
@@ -254,7 +335,7 @@ def ended_state(d: Path, jid: str) -> dict:
     s = _sacct(jid)
     if s:
         if s.startswith("TIMEOUT") or s.startswith("DEADLINE"):
-            return {"state": "timed_out", "why": f"the job hit its SLURM time limit ({s}): raise LMPT_TIMEOUT "
+            return {"state": "timed_out", "why": f"the job hit its SLURM time limit ({s}){_time_hint(d)}: raise LMPT_TIMEOUT "
                                                  "(the job asks for it + 10 min) or shorten the study (fewer MD steps, "
                                                  "a smaller cell), or give it more procs"}
         if s.startswith("OUT_OF_ME"):
@@ -270,8 +351,8 @@ def ended_state(d: Path, jid: str) -> dict:
         return {"state": "failed", "why": f"SLURM state {s}", "log_tail": tail}
     # no accounting: read job.log
     if "DUE TO TIME LIMIT" in tail:
-        return {"state": "timed_out", "why": "the job hit its SLURM time limit (job.log): raise LMPT_TIMEOUT or "
-                                             "shorten the study"}
+        return {"state": "timed_out", "why": "the job hit its SLURM time limit (job.log)" + _time_hint(d) +
+                                             ": raise LMPT_TIMEOUT or shorten the study"}
     if "CANCELLED" in tail:
         return {"state": "cancelled", "why": "cancelled (job.log)"}
     if "oom" in tail.lower() and "kill" in tail.lower():
@@ -330,7 +411,8 @@ def study_state(request: Path, name: str, q: dict | None) -> dict:
 def final_result(name: str, st: dict) -> dict:
     """A finished-without-result state as the study's result (and written as <name>.json is not: the job may
     still be found later by sacct)."""
-    out = {"ok": False, "name": name, "state": st["state"], "why": st.get("why"), "job_id": st.get("job_id")}
+    out = {"ok": False, "name": name, "state": st["state"], "why": st.get("why"), "job_id": st.get("job_id"),
+           "execution": {"executor": "slurm", "slurm_job": st.get("job_id")}}
     if st.get("log_tail"):
         out["log_tail"] = st["log_tail"]
     return out

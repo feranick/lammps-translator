@@ -1,5 +1,5 @@
 """build.py — builds the atoms of a study (lattices, packed molecules, data files), writes and reads LAMMPS data files.
-Version: 2026.10.18.3
+Version: 2026.10.18.5
 
 Atom positions, types, charges and topology are computed here, not by LAMMPS (lattice, create_atoms), so the
 translator knows every atom and the reference implementation can check LAMMPS's numbers.
