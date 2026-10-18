@@ -1,5 +1,5 @@
 """cli.py — command line: lmpt format | validate | run | inputs | bench | status | jobs | cancel | run-study
-Version: 2026.10.18.2
+Version: 2026.10.18.3
 """
 from __future__ import annotations
 
@@ -45,6 +45,7 @@ def main(argv=None) -> int:
     p.add_argument("name")
     p = sub.add_parser("bench", help="benchmarks with known answers")
     p.add_argument("names", nargs="*")
+    p.add_argument("--queue", action="store_true", help="with LMPT_EXECUTOR=slurm: every case as a SLURM job")
     p = sub.add_parser("jobs", help="recent requests with SLURM jobs, their states, the queue")
     p.add_argument("--limit", type=int, default=20)
     p.add_argument("--active", action="store_true", help="only requests with queued or running studies")
@@ -93,12 +94,13 @@ def main(argv=None) -> int:
         print(json.dumps({k: v for k, v in r.items() if k != "status"} | {"pending": r.get("status", {}).get("pending")},
                          indent=1))
     elif a.cmd == "bench":
-        r = api.bench(a.names or None)
+        r = api.bench(a.names or None, queue=True if a.queue else None)
         for n, v in r["cases"].items():
             if "skipped" in v:
                 print(f"{n:24s} skipped ({v['skipped']})")
                 continue
-            print(f"{n:24s} {'pass' if v.get('passed') else 'FAIL'}  {v.get('seconds', '')} s")
+            where = f"  SLURM job {v['job_id']}" if v.get("job_id") else ""
+            print(f"{n:24s} {'pass' if v.get('passed') else 'FAIL'}  {v.get('seconds', '')} s{where}")
             for c in v.get("checks", []):
                 print(f"    {c['quantity']:34s} got {c.get('got')!s:>22}  expected {c.get('expected')!s:>22}  "
                       f"{'rel ' + str(c.get('rel_error')) if 'rel_error' in c else ''}  {'ok' if c['pass'] else 'FAIL'}")

@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.18.2
+Version: 2026.10.18.3
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks (builds the structures, finds potential files; no LAMMPS run)
@@ -354,10 +354,10 @@ def inputs(study: dict, name: str = "study") -> dict:
     return r
 
 
-def bench(names=None, request: str | None = None, wait: float | None = None) -> dict:
+def bench(names=None, request: str | None = None, wait: float | None = None, queue: bool | None = None) -> dict:
     """Benchmarks. Locally they run here, one after another. With LMPT_EXECUTOR=slurm they are submitted like
-    studies (long ones as SLURM jobs), and evaluated when done; with wait, pending ones are reported with the
-    request to pass back as bench(request=...)."""
+    studies (long ones as SLURM jobs; queue=True: all of them), and evaluated when done; with wait, pending ones are
+    reported with the request to pass back as bench(request=...)."""
     from . import bench as B
 
     if request is None and X.kind() != "slurm":
@@ -366,6 +366,8 @@ def bench(names=None, request: str | None = None, wait: float | None = None) -> 
         return _bench_out(folder, r)
     if request is None:
         studies, pre = B.prepare(names)
+        if queue is not None:
+            studies = {n: {**st, "queue": bool(queue)} for n, st in studies.items()}
         folder = start(studies, prefix="bench", extra={"bench": list(studies), "bench_pre": pre})
     else:
         folder = Path(request).expanduser()

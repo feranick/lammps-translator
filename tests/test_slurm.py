@@ -1,4 +1,4 @@
-"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.18.2
+"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.18.3
 They run anywhere; with LAMMPS (set LMPT_LMP, or lmp on the PATH) the jobs also compute real results."""
 import json
 import os
@@ -191,6 +191,7 @@ def test_running_state_and_cancel_running_job(slurm):
 @pytest.mark.skipif(not HAVE_LAMMPS, reason="needs LAMMPS")
 def test_bench_through_slurm(slurm):
     out = api.bench(["madelung_nacl", "nve_conservation"], wait=120)
+    assert all(out["cases"][n].get("job_id") for n in out["passed"])
     assert out["passed"] == ["madelung_nacl", "nve_conservation"], json.dumps(out["cases"])[:2000]
     meta = json.loads((Path(out["request"]) / "request.json").read_text())
     assert set(meta["executor"].values()) == {"slurm"}
@@ -222,3 +223,10 @@ def test_mpi_binding_fits_the_allocation(monkeypatch):
     assert L.mpi_plan(9)["launcher"] == ["mpirun", "--bind-to", "core:overload-allowed", "-np", "9"]
     monkeypatch.setenv("LMPT_SLURM_ARGS", "--threads-per-core=2")
     assert not X._whole_cores()
+
+
+@pytest.mark.skipif(not HAVE_LAMMPS, reason="needs LAMMPS")
+def test_bench_queue_flag_overrides_min_minutes(slurm, monkeypatch):
+    monkeypatch.setenv("LMPT_SLURM_MIN_MINUTES", "1")
+    out = api.bench(["madelung_nacl"], wait=120, queue=True)
+    assert out["passed"] == ["madelung_nacl"] and out["cases"]["madelung_nacl"]["job_id"]

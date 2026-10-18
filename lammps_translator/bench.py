@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with known answers (closed forms, lattice sums, published values).
-Version: 2026.10.18.2
+Version: 2026.10.18.3
 
 Default cases take seconds; 'slow' ones run only by name. 'chain_feat_cantilever' needs fea-translator
 (and CalculiX) in the same environment and is skipped otherwise.
@@ -220,6 +220,8 @@ def evaluate(n: str, res: dict, folder: Path | None = None) -> dict:
     c = cases()[n]
     secs = (res.get("seconds") or {}).get("wall") if isinstance(res.get("seconds"), dict) else None
     row = {"what": c["what"], "ok": res.get("ok"), "reliable": res.get("reliable"), "seconds": secs}
+    if (res.get("lammps") or {}).get("slurm_job") or res.get("job_id"):
+        row["job_id"] = (res.get("lammps") or {}).get("slurm_job") or res.get("job_id")
     if res.get("state") and res.get("state") != "done":
         row["state"] = res["state"]
     if not res.get("ok"):

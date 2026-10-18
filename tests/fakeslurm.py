@@ -1,4 +1,4 @@
-"""fakeslurm.py — stand-ins for sbatch, squeue, scancel, sacct and sinfo (tests only). Version: 2026.10.18.2
+"""fakeslurm.py — stand-ins for sbatch, squeue, scancel, sacct and sinfo (tests only). Version: 2026.10.18.3
 
 State in $FAKE_SLURM/state.json. sbatch starts job.sh in the background (or holds it PENDING when the file
 $FAKE_SLURM/hold exists, and fails when $FAKE_SLURM/fail_submit exists); squeue reports RUNNING while the process

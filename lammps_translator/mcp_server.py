@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run atomistic studies with LAMMPS.
-Version: 2026.10.18.2
+Version: 2026.10.18.3
 
 Tools (all JSON):
   study_format      the study format: systems, potentials, force fields, stages. Read it first.

@@ -1,5 +1,5 @@
 """refcalc.py — an independent implementation of the energy, forces and stress of a structure.
-Version: 2026.10.18.2
+Version: 2026.10.18.3
 
 It reads the written data file and the normalised model (not the LAMMPS input), so a mistake in the
 translation (types, coefficients, units, cutoffs, charges, topology) shows up as a mismatch with LAMMPS.
