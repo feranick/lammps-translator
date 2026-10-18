@@ -1,6 +1,6 @@
 """results.py — tolerant readers of LAMMPS output: log files (thermo blocks, LMPT tagged lines, errors, warnings,
 minimizer stops), dump files, fix ave/time vector files.
-Version: 2026.10.18.5
+Version: 2026.10.18.6
 """
 from __future__ import annotations
 

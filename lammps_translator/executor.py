@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.18.5
+Version: 2026.10.18.6
 
 Settings (environment): LMPT_EXECUTOR local | slurm (local); LMPT_SLURM_MIN_MINUTES (1): studies estimated
 shorter run locally; LMPT_SLURM_ARGS: extra sbatch arguments; LMPT_PROCS (MPI ranks, --ntasks); LMPT_TIMEOUT
@@ -100,9 +100,14 @@ def job_mem(procs: int, natoms: int | None) -> str | None:
     return f"{mb}M"
 
 
+def _mem_status() -> str:
+    a = [t for t in shlex.split(os.environ.get("LMPT_SLURM_ARGS", "")) if t.startswith("--mem")]
+    return f"{a[0]} (from LMPT_SLURM_ARGS)" if a else mem_setting()
+
+
 def status() -> dict:
     out = {"kind": kind(), "sbatch": sbatch_path(), "min_minutes": min_minutes(), "procs": default_procs(),
-           "time_limit_min": time_limit_min(), "time": time_mode(), "mem": mem_setting(),
+           "time_limit_min": time_limit_min(), "time": time_mode(), "mem": _mem_status(),
            "slurm_args": os.environ.get("LMPT_SLURM_ARGS", ""), "workers": int(os.environ.get("LMPT_WORKERS", "2"))}
     if time_mode() == "estimate":
         out["time_factor"] = float(os.environ.get("LMPT_SLURM_TIME_FACTOR", "3"))

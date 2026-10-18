@@ -53,6 +53,7 @@ A deterministic **translator + checker** for LLMs: the LLM writes a structured s
 
 ## State
 
+- 2026.10.18.6 (status shows LMPT_SLURM_ARGS --mem). Mochi via MCP: jobs 2516/2517 side by side, 9 cores each, reliable; check_local stayed local; config/env there has LMPT_SLURM_ARGS=--mem=8G (overrides auto).
 - 2026.10.18.5: LMPT_SLURM_MEM=auto (default), LMPT_SLURM_TIME=estimate (option), --ntasks-per-core=1 (as EXECUTION.md now says), `execution` run record. mochi showed why memory matters: CR_CORE_MEMORY + DefMemPerNode=UNLIMITED gives each job 60000M, so jobs ran one at a time; long time limits (6 h 10 min) also stop backfill.
 - 2026.10.18.4: strip NULs from error text. Mochi: three 9-rank NVT at once (jobs 2484-2486) all done and reliable; read by the MCP jobs tool from a different server process. Not yet seen: the third job waiting (PD) while two ran (check sacct Start times), and collecting after an app restart.
 - carbonio, 2026.10.18.3, SLURM: madelung_nacl job 5515 pass; NVT 2 ranks job 5516: 2 cores, binding default, reliable, T 39.8 K; jobs/--active worked. mochi, 2026.10.18.3: madelung_nacl job 2482 pass; NVT 9 ranks job 2483: 9 cores, 18 hwthreads, binding default, reliable, 12.8 s (the allocation-overload is fixed). Still to do: two requests from two server processes queueing, MCP reconnect collecting a running job.

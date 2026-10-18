@@ -1,4 +1,4 @@
-"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.18.5
+"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.18.6
 They run anywhere; with LAMMPS (set LMPT_LMP, or lmp on the PATH) the jobs also compute real results."""
 import json
 import os
@@ -269,6 +269,7 @@ def test_job_limits_time_estimate_and_memory(slurm, monkeypatch):
     r = api.run({"lj": LJ}, wait=0)
     d = Path(r["request"]) / "lj"
     assert "--mem" not in (d / "job.sh").read_text()
+    assert api.tool_status()["executor"]["mem"] == "--mem=4G (from LMPT_SLURM_ARGS)"
     assert json.loads((d / "job.json").read_text())["command"][2:4] == ["--mem=4G", "--nice=10"]
     monkeypatch.setenv("LMPT_SLURM_ARGS", "")
     monkeypatch.setenv("LMPT_SLURM_MEM", "none")

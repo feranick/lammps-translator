@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with known answers (closed forms, lattice sums, published values).
-Version: 2026.10.18.5
+Version: 2026.10.18.6
 
 Default cases take seconds; 'slow' ones run only by name. 'chain_feat_cantilever' needs fea-translator
 (and CalculiX) in the same environment and is skipped otherwise.
