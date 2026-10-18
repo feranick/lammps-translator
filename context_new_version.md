@@ -13,7 +13,7 @@ A deterministic **translator + checker** for LLMs: the LLM writes a structured s
 **This tool:**
 
 - Name / CLI / MCP: `lammps-translator` / `lmpt` / `lmpt-mcp`; repo github.com/feranick/lammps-translator
-- Domain: atomistic simulation; target LAMMPS 4 Jul 2026 (Debian package build: MPI + OpenMP, MANYBODY, KSPACE, MOLECULE, RIGID, MEAM, ML-SNAP, EXTRA-*; no REAXFF, no GPU), runs remotely on Ubuntu servers (carbonio).
+- Domain: atomistic simulation; target LAMMPS 4 Jul 2026 (Debian package build: MPI + OpenMP, MANYBODY, KSPACE, MOLECULE, RIGID, MEAM, ML-SNAP, EXTRA-*; no REAXFF, no GPU), runs remotely on Ubuntu servers (carbonio, mochi; SLURM on a single node).
 - Typical requests: "elastic constants and vacancy energy of Cu with EAM"; "surface energy of Si(100) with Tersoff"; "density, RDF and diffusion of SPC/E water at 300 K"; "thermal expansion of Cu-30Ni, then a feat model with that material".
 - Study: `system` (lattice | molecules | data) + `potential` (metal units) or `forcefield` (real units) + ordered `stages` (energy, minimize, nve/nvt/npt, elastic, eos, vacancy, surface, thermal_expansion) + `expect`.
 - Independent checks: reference implementation (pair styles, Ewald, EAM with LAMMPS's splines, bonded terms) on every run; virial vs energy (eos), Born, Cauchy, energy drift, masses; benchmarks (lattice sums, Madelung, Cauchy, FBD86 Cu, Tersoff Si, equipartition, NVE, SPC/E, feat chain).
@@ -53,6 +53,7 @@ A deterministic **translator + checker** for LLMs: the LLM writes a structured s
 
 ## State
 
+- 2026.10.18.1: SLURM execution per llm-translators docs/EXECUTION.md (executor.py; `lmpt run-study`, `jobs`, `cancel`; states; `executor` in status). Here: 45 tests pass (18 SLURM tests with tests/fakeslurm.py, real LAMMPS 22 Jul 2025 inside the fake jobs). To do on mochi: `LMPT_EXECUTOR=slurm` with `madelung_nacl` and a short NVT run; two requests from two processes queue rather than oversubscribe; close the MCP connection while a job runs, reconnect, collect.
 - 2026.10.16.2: clearer 'LAMMPS not found' (first server run reported 'no log' for every benchmark: LAMMPS was not found there; tests skipped). 2026.10.16.1 (first version). Here, with LAMMPS 22 Jul 2025: 27 tests pass; default benchmarks 8/8 pass; reference check exact (≤1e-13) for lj, morse, buck, eam, eam/alloy, eam/fs, bonded terms; Ewald 2e-7 (LAMMPS's erfc). SPC/E short run: ρ 0.999 ± 0.003, U −46.78 kJ/mol. feat chain via MCP: Cu E = 124.7 GPa, ν 0.35 → cantilever 1.2786 vs 1.2832 mm.
 - carbonio (LAMMPS 4 Jul 2026 at /usr/bin/lmp, potentials /usr/share/lammps/potentials, fea-translator 2026.10.16.9 in the venv): 27 tests pass; `lmpt bench` 9/9 pass, same numbers as 22 Jul 2025 (equipartition 0.04 %), chain_feat_cantilever 0.36 %.
 - spce_water on carbonio: pass (ρ 0.9972 g/cm3, U −46.60 kJ/mol, O–O peak 2.725 Å; 535 s). All 10 benchmarks pass with LAMMPS 4 Jul 2026.

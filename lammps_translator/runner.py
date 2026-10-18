@@ -1,5 +1,5 @@
 """runner.py — one study end to end: build, write inputs stage by stage, run LAMMPS, read, analyse, check.
-Version: 2026.10.16.2
+Version: 2026.10.18.1
 
 Folder layout (<request>/<study>/):
     initial.data, potentials/, 00_setup/ (in.lammps, log.lammps, forces0.dump), 01_<stage>/ ..., run_all.sh,
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 import tarfile
 import time
@@ -70,6 +71,16 @@ def stage_names(stages: list) -> list[str]:
     return out
 
 
+class Cancelled(RuntimeError):
+    pass
+
+
+def write_json_atomic(path: Path, obj) -> None:
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(obj, indent=1))
+    os.replace(tmp, path)
+
+
 class Study:
     def __init__(self, name: str, study: dict, folder: Path, timeout: float, procs: int):
         self.name, self.study, self.folder, self.timeout, self.procs = name, study, folder, timeout, procs
@@ -127,6 +138,10 @@ class Study:
         (self.folder / "progress.json").write_text(json.dumps(
             {"current": i, "stages": plan, "started": self.t_start, "stage_started": time.time()}))
 
+    def check_cancel(self):
+        if (self.folder / "CANCEL").is_file():
+            raise Cancelled("cancelled with cancel()")
+
     def run_input(self, sid: str, lines: list[str]) -> dict:
         d = self.folder / sid
         d.mkdir(exist_ok=True)
@@ -135,6 +150,8 @@ class Study:
         r = lmp_run("in.lammps", "log.lammps", d, self.procs, remaining)
         self.lmp_seconds += r.get("seconds", 0.0)
         log = read_log(d / "log.lammps")
+        if r.get("cancelled"):
+            raise Cancelled(f"cancelled with cancel() during {sid}")
         if not (d / "log.lammps").is_file():
             why = r.get("error") or r.get("stderr") or f"exit code {r['rc']}"
             raise RuntimeError(f"LAMMPS did not start in {sid} ({r.get('command', '')}): {why[:800]}")
@@ -176,6 +193,7 @@ class Study:
         state_file = "../initial.data"
         for i, (sd, nm) in enumerate(zip(st["stages"], self.names)):
             sid = plan[i + 1]["id"]
+            self.check_cancel()
             self.progress(i + 1, plan)
             (self.folder / sid).mkdir(exist_ok=True)
             out = self.write_stage(sd, state, state_file, i + 1, self.folder / sid)
@@ -531,9 +549,8 @@ def run_study(name: str, study: dict, folder: Path, timeout: float = 3600.0, pro
     v = validate_study(study)
     if not v["ok"]:
         out = {"ok": False, "name": name, "why": "invalid study", "errors": v["errors"], "warnings": v["warnings"]}
-        (folder / f"{name}.json").write_text(json.dumps(out, indent=1))
+        write_json_atomic(folder / f"{name}.json", out)
         return out
-    import os
     np_ = procs or int(study.get("procs", os.environ.get("LMPT_PROCS", "1")))
     st = Study(name, study, folder, timeout, np_)
     st.warnings += v["warnings"]
@@ -542,12 +559,14 @@ def run_study(name: str, study: dict, folder: Path, timeout: float = 3600.0, pro
         res = st.run()
     except Exception as exc:  # noqa: BLE001
         res.update({"ok": False, "why": str(exc)[:1500]})
+        if isinstance(exc, Cancelled):
+            res["state"] = "cancelled"
         if not isinstance(exc, (ValueError, RuntimeError)):
             res["trace"] = traceback.format_exc()[-3000:]
         if "structure" not in res and hasattr(st, "s0"):
             res["structure"] = structure_info(st.s0)
     out = finish(res, st, folder, name, study)
-    (folder / f"{name}.json").write_text(json.dumps(out, indent=1))
+    write_json_atomic(folder / f"{name}.json", out)
     try:
         (folder / "progress.json").unlink()
     except OSError:

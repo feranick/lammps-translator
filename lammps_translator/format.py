@@ -1,5 +1,5 @@
 """format.py — the study format (what an LLM reads first) and static validation with fixable messages.
-Version: 2026.10.16.2
+Version: 2026.10.18.1
 """
 from __future__ import annotations
 
@@ -87,7 +87,9 @@ def study_format() -> dict:
             "potential": "atomic systems (below)",
             "forcefield": "molecular systems (optional when every molecule is built in)",
             "stages": "[{kind, name?, ...}] in order (below)",
-            "procs": "MPI ranks (default LMPT_PROCS or 1)", "seed": "random seed (12345)", "expect": "checks",
+            "procs": "MPI ranks (default LMPT_PROCS or 1; SLURM --ntasks)", "seed": "random seed (12345)",
+            "expect": "checks", "queue": "with LMPT_EXECUTOR=slurm: true always a SLURM job, false always local "
+                                         "(default: by the time estimate)",
         },
         "system": {
             "lattice": {"kind": {**LATTICE_DOC},
@@ -509,7 +511,7 @@ def validate_study(study) -> dict:
     if not isinstance(study, dict):
         return {"ok": False, "errors": ["a study is an object {system, potential|forcefield, stages}"], "warnings": []}
     unknown = sorted(set(study) - {"system", "potential", "forcefield", "stages", "procs", "seed", "expect",
-                                   "description"})
+                                   "description", "queue"})
     if unknown:
         E.append(f"study: unknown keys {unknown}")
     _check_system(study.get("system"), E, W)
@@ -542,6 +544,8 @@ def validate_study(study) -> dict:
                          "-dE/dV of its tail energy, so the minimizer's line search fails): set tail false, or use npt")
         if "lattice" in s:
             W.append("tail: corrections assume a uniform fluid beyond the cutoff; for crystals use a longer cutoff instead")
+    if "queue" in study and not isinstance(study["queue"], bool):
+        E.append("queue: true (always a SLURM job) or false (always local); omit to let the time estimate decide")
     if "procs" in study and not (isinstance(study["procs"], int) and study["procs"] >= 1):
         E.append("procs: MPI ranks, integer >= 1")
     if "seed" in study and not (isinstance(study["seed"], int) and 0 < study["seed"] < 900000000):

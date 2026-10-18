@@ -1,5 +1,5 @@
 """lammps.py — the only module that runs LAMMPS: finds the executable, reads its capabilities, runs inputs.
-Version: 2026.10.16.2
+Version: 2026.10.18.1
 
 Executable: LMPT_LMP (a command, e.g. 'lmp', '/opt/lammps/bin/lmp_mpi' or 'mpirun -np 4 lmp'), else the first of
 lmp, lmp_mpi, lmp_serial, lmp_stable, lmp_openmpi, lammps on the PATH, else the same names in /usr/bin,
@@ -109,11 +109,44 @@ def run(input_name: str, log_name: str, cwd: Path, procs: int = 1, timeout: floa
     env = dict(os.environ)
     env.setdefault("OMP_NUM_THREADS", "1")
     t0 = time.perf_counter()
+    cancel = Path(cwd).parent / "CANCEL"      # written by api.cancel for a local study
+    cancelled = False
     try:
-        r = subprocess.run(full, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
-        rc, err = r.returncode, (r.stderr or "")[-2000:] + (r.stdout or "")[-1000:]
-    except subprocess.TimeoutExpired:
-        rc, err = -9, f"timed out after {timeout:g} s"
+        p = subprocess.Popen(full, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                             start_new_session=True)
     except OSError as exc:
-        rc, err = -1, str(exc)
-    return {"rc": rc, "seconds": round(time.perf_counter() - t0, 3), "stderr": err.strip(), "command": " ".join(full)}
+        return {"rc": -1, "seconds": 0.0, "stderr": str(exc), "command": " ".join(full)}
+    rc = None
+    while rc is None:
+        try:
+            out, err = p.communicate(timeout=1.0)
+            rc = p.returncode
+        except subprocess.TimeoutExpired:
+            el = time.perf_counter() - t0
+            if cancel.is_file() or el > timeout:
+                cancelled = cancel.is_file()
+                _kill(p)
+                out, err = p.communicate()
+                rc = -9
+                err = (err or "") + ("\ncancelled" if cancelled else f"\ntimed out after {timeout:g} s")
+    msg = (err or "")[-2000:] + (out or "")[-1000:]
+    if rc == -9 and not cancelled:
+        msg = f"timed out after {timeout:g} s (LMPT_TIMEOUT)"
+    res = {"rc": rc, "seconds": round(time.perf_counter() - t0, 3), "stderr": msg.strip(), "command": " ".join(full)}
+    if cancelled:
+        res["cancelled"] = True
+    return res
+
+
+def _kill(p: subprocess.Popen) -> None:
+    import signal
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(p.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            p.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue

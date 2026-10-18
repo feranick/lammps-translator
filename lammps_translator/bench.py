@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with known answers (closed forms, lattice sums, published values).
-Version: 2026.10.16.2
+Version: 2026.10.18.1
 
 Default cases take seconds; 'slow' ones run only by name. 'chain_feat_cantilever' needs fea-translator
 (and CalculiX) in the same environment and is skipped otherwise.
@@ -190,69 +190,87 @@ def _chain_feat(res: dict, folder: Path) -> dict:
                         "pass": abs(uz - expect) <= 0.02 * expect}]}
 
 
-def run(names=None, folder: Path | None = None) -> dict:
+def prepare(names=None) -> tuple[dict, dict]:
+    """The benchmark studies to run ({name: study}) and the rows already known (unknown names, skipped cases)."""
     allc = cases()
     if not names:
         names = [k for k, v in allc.items() if not v.get("slow")]
-    out = {}
+    studies, pre = {}, {}
     for n in names:
         if n not in allc:
-            out[n] = {"ok": False, "why": f"no benchmark '{n}' ({sorted(allc)})"}
+            pre[n] = {"ok": False, "why": f"no benchmark '{n}' ({sorted(allc)})"}
             continue
         c = allc[n]
-        t0 = time.time()
-        st = dict(c["study"])
-        if "rename" in c:
-            st = {**st, "stages": [dict(s, name=c["rename"].get(s["kind"])) if s["kind"] in c["rename"] else s
-                                   for s in st["stages"]]}
         if c.get("needs"):
             try:
                 __import__(c["needs"])
             except ImportError:
-                out[n] = {"skipped": f"{c['needs']} not installed", "what": c["what"]}
+                pre[n] = {"skipped": f"{c['needs']} not installed", "what": c["what"]}
                 continue
-        res = run_study(n, st, (folder or Path(".")) / n, 3600)
-        row = {"what": c["what"], "ok": res.get("ok"), "reliable": res.get("reliable"), "seconds": round(time.time() - t0, 2)}
-        if not res.get("ok"):
-            row.update({"passed": False, "why": res.get("why") or res.get("errors")})
-            out[n] = row
-            continue
-        checks = []
-        if n == "chain_feat_cantilever":
-            ch = _chain_feat(res, folder or Path("."))
-            if "skipped" in ch:
-                out[n] = {"skipped": ch["skipped"], "what": c["what"]}
-                continue
-            checks = ch.get("checks", [])
-            if not checks:
-                row.update({"passed": False, "why": ch.get("why")})
-                out[n] = row
-                continue
-        for chk in c.get("checks", []):
-            q, ref, tol = chk[0], chk[1], chk[2]
-            try:
-                got = _get(res, q)
-                if isinstance(ref, str):
-                    expv = _get(res, ref)
-                elif isinstance(ref, tuple):
-                    expv = _get(res, ref[0]) + ref[1]
-                else:
-                    expv = float(ref)
-            except (KeyError, IndexError, ValueError, TypeError) as exc:
-                checks.append({"quantity": q, "pass": False, "why": f"missing {exc}"})
-                continue
-            if tol is None:
-                ok = abs(got - expv) <= chk[3]
-                checks.append({"quantity": q, "got": got, "expected": expv, "abs": chk[3], "pass": ok})
+        st = dict(c["study"])
+        if "rename" in c:
+            st = {**st, "stages": [dict(s, name=c["rename"].get(s["kind"])) if s["kind"] in c["rename"] else s
+                                   for s in st["stages"]]}
+        studies[n] = st
+    return studies, pre
+
+
+def evaluate(n: str, res: dict, folder: Path | None = None) -> dict:
+    """A benchmark's row from its study result."""
+    c = cases()[n]
+    secs = (res.get("seconds") or {}).get("wall") if isinstance(res.get("seconds"), dict) else None
+    row = {"what": c["what"], "ok": res.get("ok"), "reliable": res.get("reliable"), "seconds": secs}
+    if res.get("state") and res.get("state") != "done":
+        row["state"] = res["state"]
+    if not res.get("ok"):
+        row.update({"passed": False, "why": res.get("why") or res.get("errors")})
+        return row
+    checks = []
+    if n == "chain_feat_cantilever":
+        ch = _chain_feat(res, folder or Path("."))
+        if "skipped" in ch:
+            return {"skipped": ch["skipped"], "what": c["what"]}
+        checks = ch.get("checks", [])
+        if not checks:
+            row.update({"passed": False, "why": ch.get("why")})
+            return row
+    for chk in c.get("checks", []):
+        q, ref, tol = chk[0], chk[1], chk[2]
+        try:
+            got = _get(res, q)
+            if isinstance(ref, str):
+                expv = _get(res, ref)
+            elif isinstance(ref, tuple):
+                expv = _get(res, ref[0]) + ref[1]
             else:
-                rel = abs(got - expv) / max(abs(expv), 1e-30)
-                checks.append({"quantity": q, "got": got, "expected": expv, "tol": tol, "rel_error": float(f"{rel:.3g}"),
-                               "pass": rel <= tol})
-        row["checks"] = checks
-        row["why_tol"] = c.get("why_tol")
-        row["self_checks"] = res.get("checks")
-        row["passed"] = all(x["pass"] for x in checks) and bool(res.get("reliable"))
-        if not res.get("reliable"):
-            row["unreliable_because"] = res.get("unreliable_because")
+                expv = float(ref)
+        except (KeyError, IndexError, ValueError, TypeError) as exc:
+            checks.append({"quantity": q, "pass": False, "why": f"missing {exc}"})
+            continue
+        if tol is None:
+            ok = abs(got - expv) <= chk[3]
+            checks.append({"quantity": q, "got": got, "expected": expv, "abs": chk[3], "pass": ok})
+        else:
+            rel = abs(got - expv) / max(abs(expv), 1e-30)
+            checks.append({"quantity": q, "got": got, "expected": expv, "tol": tol, "rel_error": float(f"{rel:.3g}"),
+                           "pass": rel <= tol})
+    row["checks"] = checks
+    row["why_tol"] = c.get("why_tol")
+    row["self_checks"] = res.get("checks")
+    row["passed"] = all(x["pass"] for x in checks) and bool(res.get("reliable"))
+    if not res.get("reliable"):
+        row["unreliable_because"] = res.get("unreliable_because")
+    return row
+
+
+def run(names=None, folder: Path | None = None) -> dict:
+    """Runs the benchmarks here, one after another (the local executor)."""
+    studies, out = prepare(names)
+    for n, st in studies.items():
+        t0 = time.time()
+        res = run_study(n, st, (folder or Path(".")) / n, 3600)
+        row = evaluate(n, res, folder)
+        row["seconds"] = round(time.time() - t0, 2)
         out[n] = row
-    return out
+    order = names or [k for k in cases() if k in out]
+    return {k: out[k] for k in order if k in out} | {k: v for k, v in out.items() if k not in order}

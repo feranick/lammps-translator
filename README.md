@@ -15,7 +15,7 @@ cd ~/Software && git clone https://github.com/feranick/lammps-translator.git    
 source ~/Software/build123d-translator/.venv/bin/activate                          # shared venv (alias cad)
 pip install -e "$HOME/Software/lammps-translator[mcp,test]"
 lmpt status            # LAMMPS found? version, packages, potentials folders, fea-translator
-pytest -q              # 27 tests: 22 run anywhere, 5 need LAMMPS (skipped when it is not found)
+pytest -q              # 45 tests: 37 run anywhere (SLURM ones with fake sbatch/squeue), 8 need LAMMPS
 lmpt bench             # benchmarks (~17 s); slow ones by name: lmpt bench spce_water (~9 min, run it from the shell)
 ```
 
@@ -29,9 +29,23 @@ lmpt validate examples/studies.json      # static checks with fixable messages (
 lmpt run examples/studies.json           # run, check; results in ~/lmpt_runs/run_*/
 lmpt run examples/studies.json cu_properties --json
 lmpt inputs examples/studies.json cu_properties   # write the LAMMPS inputs only (inspect, run by hand)
+lmpt jobs [--active]                     # recent requests with SLURM jobs, their states, the queue
+lmpt cancel REQUEST [NAME ...]           # stop a request's studies
+lmpt run-study REQUEST NAME              # run one study of a request (what a SLURM job runs)
 ```
 
-Every run writes `<request>/<study>/`: `initial.data`, `potentials/` (copies), one folder per stage (`00_setup`, `01_minimize`, ...) with `in.lammps`, `log.lammps`, `state.data` and stage files (`rdf.txt`, `traj.lammpstrj`, slab and vacancy data), `run_all.sh` (reruns every input in order with plain LAMMPS) and `<study>.json`; plus `<study>.tgz`. Environment: `LMPT_OUT` (~/lmpt_runs), `LMPT_WORKERS` (2), `LMPT_TIMEOUT` (21600 s per study), `LMPT_PROCS` (MPI ranks, 1; or the study's `procs`), `LMPT_MPIRUN` (mpirun).
+Every run writes `<request>/<study>/`: `initial.data`, `potentials/` (copies), one folder per stage (`00_setup`, `01_minimize`, ...) with `in.lammps`, `log.lammps`, `state.data` and stage files (`rdf.txt`, `traj.lammpstrj`, slab and vacancy data), `run_all.sh` (reruns every input in order with plain LAMMPS) and `<study>.json`; plus `<study>.tgz`. Environment: `LMPT_OUT` (~/lmpt_runs), `LMPT_WORKERS` (2), `LMPT_TIMEOUT` (21600 s per study), `LMPT_PROCS` (MPI ranks, 1; or the study's `procs`), `LMPT_MPIRUN` (mpirun), `LMPT_EXECUTOR`, `LMPT_SLURM_MIN_MINUTES`, `LMPT_SLURM_ARGS` (below).
+
+## Long runs: SLURM
+
+With `LMPT_EXECUTOR=slurm` (in llm-translators' `config/env`), each long study is a SLURM job instead of a worker of the MCP server, following llm-translators' [docs/EXECUTION.md](https://github.com/feranick/llm-translators/blob/main/docs/EXECUTION.md). Studies from every chat then share the machine through one queue, and a job keeps running when the conversation or its ssh connection ends.
+
+- **Which studies.** A study whose time estimate (atoms × steps × a per-style cost, rough) is below `LMPT_SLURM_MIN_MINUTES` (1) runs locally; the others, and those with no estimate, are jobs. `"queue": true` / `false` in a study forces a job / a local run (not with `LMPT_EXECUTOR=local`).
+- **The job.** `<request>/<name>/job.sh`, submitted with `sbatch --parsable $LMPT_SLURM_ARGS job.sh`: job name `lmpt:<request>:<name>`, `--ntasks` = the study's `procs` or `LMPT_PROCS`, `--time` = ceil(`LMPT_TIMEOUT`/60) + 10 min (6 h 10 min with the default 6 h: the translator stops first and writes a clean result), `--export=ALL`, and `exec <the server's python> -m lammps_translator.cli run-study <request> <name>`. Inside, LAMMPS runs with `$LMPT_MPIRUN -np $SLURM_NTASKS lmp` (one rank: `lmp` alone). `job.json` records the id. `sbatch job.sh` reruns it by hand. If `sbatch` fails, the study's result is `ok: false, why: "could not submit: ..."` (never a silent local run).
+- **States.** `study_status` keeps its shape; a pending study's `progress` has `state`: `queued` (`reason`, `expected_start`, `ahead`), `running` (stage, MD steps, `eta_min_max`, `job_elapsed_min`). They come from the files and one `squeue` call, so any server process, after restarts or from another chat, can collect them. A job that leaves the queue without a result ends as `timed_out`, `out_of_memory`, `cancelled` or `failed` (from `sacct`, or from `job.log` when there is no accounting), with `ok: false` and what to change.
+- **`jobs` and `cancel`.** `jobs(limit, active)` lists the newest requests with jobs, the queue (`running`, `queued`, `cpus_in_use` of `lmpt:` jobs) and the machine (`sinfo` CPUs). `cancel(request, names)` runs `scancel`; in local mode it stops a study only if this server process runs it.
+- **Benchmarks** go through the same path: `lmpt bench` waits for them; the MCP tool returns pending cases with a `request` to pass back as `run_benchmarks(request=...)`.
+- `lmpt status` (`tool_status`) reports `executor: {kind, sbatch, min_minutes, procs, time_limit_min, slurm_args, workers}`.
 
 ## A study
 
@@ -123,7 +137,7 @@ Per stage under its name (default: its kind; repeats get `_2`), plus `structure`
 
 ## For LLM tools: the MCP server
 
-Tools: `study_format`, `validate_studies`, `run_studies` (returns within ~45 s; long studies come back `pending` with `progress`: stage, MD steps done of total, s/step, `eta_min_max`), `study_status`, `get_inputs`, `run_benchmarks`, `get_file` (base64, for callers on another machine). In `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Tools: `study_format`, `validate_studies`, `run_studies` (returns within ~45 s; long studies come back `pending` with `progress`: state, stage, MD steps done of total, s/step, `eta_min_max`; with SLURM the job id), `study_status`, `get_inputs`, `jobs`, `cancel`, `run_benchmarks`, `get_file` (base64, for callers on another machine). In `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 "lmpt": {"command": "/usr/bin/ssh",
@@ -131,7 +145,7 @@ Tools: `study_format`, `validate_studies`, `run_studies` (returns within ~45 s; 
                   "/home/nicola/Software/build123d-translator/.venv/bin/lmpt-mcp"]}
 ```
 
-Polling costs tokens: every `study_status` call is a model turn. The server's instructions tell the model to report the expected finish time and stop when a run needs more than about 5 minutes, and to collect the result later. `lmpt-mcp --http 8769 --host 0.0.0.0` serves streamable HTTP instead of stdio. Results' `feat_material` goes as the `material` of a fea-translator study.
+Polling costs tokens: every `study_status` call is a model turn. The server's instructions tell the model to report the expected finish time and stop when a run needs more than about 5 minutes, and to collect the result later; with SLURM, not to poll at all (the jobs do not depend on the conversation) and to find runs again with `jobs()`. `lmpt-mcp --http 8769 --host 0.0.0.0` serves streamable HTTP instead of stdio. Results' `feat_material` goes as the `material` of a fea-translator study.
 
 ## Files
 
@@ -142,14 +156,16 @@ lammps_translator/
   build.py      atoms, topology, data files      results.py   log, dump, ave/time readers
   potential.py  files, force fields, commands    analysis.py  Cij, EOS, averages, RDF, MSD
   refcalc.py    reference implementation         runner.py    one study end to end
-  bench.py      benchmarks                       api.py, cli.py, mcp_server.py
-tests/test_lmpt.py    examples/studies.json    CLAUDE.md (session context)
+  bench.py      benchmarks                       executor.py  local pool or SLURM jobs, states
+  api.py, cli.py, mcp_server.py
+tests/test_lmpt.py  tests/test_slurm.py  tests/fakeslurm.py    examples/studies.json    context_new_version.md
 ```
 
 ## Versions
 
 | version | changes |
 |---|---|
+| 2026.10.18.1 | SLURM execution (llm-translators docs/EXECUTION.md): `LMPT_EXECUTOR=slurm`, one job per study (`job.sh`, `job.json`; `--ntasks` from `procs`/`LMPT_PROCS`, `--time` = timeout + 10 min), `LMPT_SLURM_MIN_MINUTES` with a time estimate, `"queue"` per study, `LMPT_SLURM_ARGS`; states queued/running/timed_out/out_of_memory/cancelled/failed from squeue, sacct or job.log; `lmpt run-study`, `lmpt jobs`, `lmpt cancel` and the `jobs`, `cancel` MCP tools; `executor` in `tool_status`; benchmarks through the executor; local cancel (LAMMPS stopped, study ends `cancelled`); results written atomically. Tests with fake sbatch/squeue/scancel/sacct/sinfo (18). |
 | 2026.10.16.2 | LAMMPS discovery: also `lmp_stable`, `lmp_openmpi` and /usr/bin, /usr/local/bin, /opt/lammps/bin, ~/.local/bin; `LMPT_LMP` with `~`; a missing LAMMPS stops the study with what to set (it was reported as 'no log'), and a run that writes no log reports LAMMPS's own error. 27 tests. Server results (LAMMPS 4 Jul 2026, carbonio): 27 tests, 9/9 benchmarks pass (with the fea-translator chain). |
 | 2026.10.16.1 | First version: lattices (11 kinds, orient, substitution), packed molecules (SPC/E, TIP3P, methane UA, custom), data files; EAM/ADP/Tersoff/SW/MEAM/AIREBO/SNAP files and LJ/Morse/Buckingham + Coulomb (Ewald, PPPM); force fields with harmonic bonds/angles, OPLS dihedrals, SHAKE; stages energy, minimize, nve/nvt/npt (RDF, MSD), elastic, eos, vacancy, surface, thermal_expansion; reference implementation; 10 benchmarks; feat_material; MCP server with pending runs, progress and ETA. Tested with LAMMPS 22 Jul 2025 (PyPI wheel, aarch64): 26 tests, 8 default benchmarks pass. |
 

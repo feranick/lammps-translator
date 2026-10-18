@@ -1,5 +1,5 @@
-"""cli.py — command line: lmpt format | validate | run | inputs | bench | status
-Version: 2026.10.16.2
+"""cli.py — command line: lmpt format | validate | run | inputs | bench | status | jobs | cancel | run-study
+Version: 2026.10.18.1
 """
 from __future__ import annotations
 
@@ -45,6 +45,15 @@ def main(argv=None) -> int:
     p.add_argument("name")
     p = sub.add_parser("bench", help="benchmarks with known answers")
     p.add_argument("names", nargs="*")
+    p = sub.add_parser("jobs", help="recent requests with SLURM jobs, their states, the queue")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--active", action="store_true", help="only requests with queued or running studies")
+    p = sub.add_parser("cancel", help="stop a request's studies (all, or the named ones)")
+    p.add_argument("request")
+    p.add_argument("names", nargs="*")
+    p = sub.add_parser("run-study", help="run one study of a request (the SLURM job's command)")
+    p.add_argument("request")
+    p.add_argument("name")
     a = ap.parse_args(argv)
     if a.cmd == "format":
         print(json.dumps(api.study_format(), indent=1))
@@ -75,6 +84,14 @@ def main(argv=None) -> int:
         for k, v in r["inputs"].items():
             print(f"===== {k}\n{v}\n")
         print(f"written to {r['folder']}")
+    elif a.cmd == "run-study":
+        return api.run_one(a.request, a.name)
+    elif a.cmd == "jobs":
+        print(json.dumps(api.jobs(a.limit, a.active), indent=1))
+    elif a.cmd == "cancel":
+        r = api.cancel(a.request, a.names or None)
+        print(json.dumps({k: v for k, v in r.items() if k != "status"} | {"pending": r.get("status", {}).get("pending")},
+                         indent=1))
     elif a.cmd == "bench":
         r = api.bench(a.names or None)
         for n, v in r["cases"].items():

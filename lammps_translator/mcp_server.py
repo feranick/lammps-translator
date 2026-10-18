@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run atomistic studies with LAMMPS.
-Version: 2026.10.16.2
+Version: 2026.10.18.1
 
 Tools (all JSON):
   study_format      the study format: systems, potentials, force fields, stages. Read it first.
@@ -8,6 +8,8 @@ Tools (all JSON):
   study_status      collects the pending studies of a run_studies request
   get_inputs        the LAMMPS inputs and data file of one study, without running
   run_benchmarks    the benchmark studies with known answers (is the toolchain right?)
+  jobs              recent and active SLURM runs (also from other conversations), the queue, the machine
+  cancel            stops a request's studies
   get_file          a written file as base64 (for callers on another machine)
 
 Run:  lmpt-mcp                       (stdio)
@@ -17,7 +19,7 @@ from __future__ import annotations
 
 import argparse
 
-from . import api
+from . import api, executor
 
 try:  # MCP Python SDK 2.x
     from mcp.server.mcpserver import MCPServer as _Server
@@ -39,6 +41,10 @@ and 'reliable' before trusting numbers; if 'reliable' is false, do not report th
 'unreliable_because' says). MD numbers are statistical: report mean with err; run longer if err is large.
 Pending studies report 'progress' with eta_min_max: polling costs tokens, so when a run needs more than about
 5 minutes, tell the user when it should finish and stop; collect it later with study_status.
+Long studies run as SLURM jobs on the machine (when LMPT_EXECUTOR=slurm): run_studies returns them pending with
+job ids. They do not depend on this conversation. Report the expected finish time and stop; do not poll. Later,
+study_status(request) collects them; jobs() lists recent and active runs (also those started in other
+conversations); cancel(request) stops them.
 Units: potentials eV, A (metal); force fields kcal/mol, A (real); T in K, P_bar in bar, dt_fs in fs; results in
 eV, A, GPa, K, ps, g/cm3, J/m2."""
 
@@ -65,14 +71,17 @@ def run_studies(studies: dict, wait_s: float = 45) -> dict:
     constants, Cij, moduli, EOS fit, vacancy/surface energies, MD means and errors, RDF, diffusion), 'structure',
     'final', 'feat_material', 'checks' (reference implementation vs LAMMPS, Born stability, Cauchy, virial vs
     energy, energy drift), 'reliable', warnings and files. Returns after at most wait_s seconds: studies still
-    running are listed in 'pending' with progress and ETA; collect them with study_status."""
+    running are listed in 'pending' with progress and ETA (with SLURM: state queued/running, job id); collect
+    them with study_status. A study's "queue": true/false forces a SLURM job / a local run."""
     return api.run(studies, wait=min(max(float(wait_s), 0.0), 50.0))
 
 
 @server.tool()
 def study_status(request: str, wait_s: float = 45) -> dict:
     """The studies of a run_studies request (its 'request' path): finished ones with their results, the others
-    in 'pending' with progress. Waits up to wait_s seconds (at most 50) for them to finish."""
+    in 'pending' with progress and state (queued: reason, expected_start, ahead; running: stage, eta_min_max,
+    job_elapsed_min). Jobs that ended without a result (timed_out, out_of_memory, cancelled, failed) are results
+    with ok false and why. Waits up to wait_s seconds (at most 50) for them to finish."""
     return api.status(request, min(max(float(wait_s), 0.0), 50.0))
 
 
@@ -84,11 +93,27 @@ def get_inputs(study: dict, name: str = "study") -> dict:
 
 
 @server.tool()
-def run_benchmarks(names: list[str] | None = None) -> dict:
+def jobs(limit: int = 20, active: bool = False) -> dict:
+    """The newest requests that have SLURM jobs (from any conversation), each study's state, job id and ETA;
+    queue {running, queued, cpus_in_use} for this translator's jobs; machine {cpus, cpus_allocated}.
+    active=True: only requests with queued or running studies."""
+    return api.jobs(limit, active)
+
+
+@server.tool()
+def cancel(request: str, names: list[str] | None = None) -> dict:
+    """Stops a request's studies (all, or the named ones): scancel for SLURM jobs; a local study only if this
+    server process runs it. Returns what was cancelled and the request's states."""
+    return api.cancel(request, names)
+
+
+@server.tool()
+def run_benchmarks(names: list[str] | None = None, request: str | None = None) -> dict:
     """Runs the benchmark studies with known answers (LJ lattice sums, Madelung constants, Cauchy relation,
     Cu EAM and Si Tersoff published values, equipartition, NVE conservation; slow: spce_water; chain with
-    fea-translator: chain_feat_cantilever) and reports pass or fail."""
-    return api.bench(names)
+    fea-translator: chain_feat_cantilever) and reports pass or fail. With SLURM, long cases become jobs: pending
+    ones come back with 'request'; call run_benchmarks(request=...) later to evaluate them."""
+    return api.bench(names, request, wait=45.0 if executor.kind() == "slurm" or request else None)
 
 
 @server.tool()
