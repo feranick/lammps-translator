@@ -1,4 +1,4 @@
-"""Tests for lammps-translator. Version: 2026.10.20.1
+"""Tests for lammps-translator. Version: 2026.10.20.2
 Most run anywhere (builder, validation, reference implementation, readers, analysis); the ones marked
 'needs LAMMPS' are skipped when no executable is found (set LMPT_LMP)."""
 import json

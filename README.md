@@ -172,13 +172,14 @@ lammps_translator/
   refcalc.py    reference implementation         runner.py    one study end to end
   bench.py      benchmarks                       executor.py  local pool or SLURM jobs, states
   api.py, cli.py, mcp_server.py
-tests/test_lmpt.py  tests/test_slurm.py  tests/fakeslurm.py    examples/studies.json    context_new_version.md
+tests/test_lmpt.py  tests/test_slurm.py  tests/fakeslurm.py  tests/conftest.py    examples/studies.json    context_new_version.md
 ```
 
 ## Versions
 
 | version | changes |
 |---|---|
+| 2026.10.20.2 | Tests ignore the machine's settings (`tests/conftest.py` clears `LMPT_*` and `SLURM_*` for every test): on carbonio, `LMPT_PROCS=2` from `config/env` failed `test_rotated_cell_elastic_constants`, and with `LMPT_EXECUTOR=slurm` some tests submitted real jobs. |
 | 2026.10.20.1 | Per-study run settings (docs/EXECUTION.md, as cfdt 2026.10.20.1): `run` {`timeout_s`, `mem`, `procs`, `queue`} with ceilings `LMPT_MAX_TIMEOUT`, `LMPT_MAX_MEM`, `LMPT_MAX_PROCS`; validation of caps, unknown keys, sizes and conflicts; `run.mem` replaces `--mem…` in `LMPT_SLURM_ARGS`; `job.json` keeps `run`; `execution.limits`; `executor.timeout_s` and `caps` in status. Ranks capped at atoms / `LMPT_ATOMS_PER_RANK` (2000) before submitting and locally. 62 tests. |
 | 2026.10.18.6 | `executor.mem` in `lmpt status` shows a `--mem` from `LMPT_SLURM_ARGS` when it overrides `LMPT_SLURM_MEM`. Mochi, 2026.10.18.5 through the MCP server: two 9-rank NVT studies ran side by side as jobs 2516 and 2517 (9 cores each, default binding, reliable, identical results), and a 64-atom Madelung study in the same request stayed local (estimate under 1 min). |
 | 2026.10.18.5 | Job limits: `LMPT_SLURM_MEM` (`auto` by default: memory from ranks and atoms, so jobs share a node whose SLURM gives each job all memory by default), `LMPT_SLURM_TIME=estimate` (`--time` from the study's estimate, for backfill; `LMPT_SLURM_TIME_FACTOR`, `LMPT_SLURM_TIME_MIN`); whole cores with `--ntasks-per-core=1` (docs/EXECUTION.md) instead of `--hint=nomultithread`; the run record `execution` in every result (replaces `lammps.slurm_job` and `lammps.mpi`). 49 tests. |

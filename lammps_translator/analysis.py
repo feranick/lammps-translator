@@ -1,6 +1,6 @@
 """analysis.py — numbers from LAMMPS output: stresses, elastic constants and moduli, Birch-Murnaghan fits,
 MD averages with block errors, diffusion, RDF peaks.
-Version: 2026.10.20.1
+Version: 2026.10.20.2
 """
 from __future__ import annotations
 
