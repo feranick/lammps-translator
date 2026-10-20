@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run atomistic studies with LAMMPS.
-Version: 2026.10.18.6
+Version: 2026.10.20.1
 
 Tools (all JSON):
   study_format      the study format: systems, potentials, force fields, stages. Read it first.
@@ -44,7 +44,8 @@ Pending studies report 'progress' with eta_min_max: polling costs tokens, so whe
 Long studies run as SLURM jobs on the machine (when LMPT_EXECUTOR=slurm): run_studies returns them pending with
 job ids. They do not depend on this conversation. Report the expected finish time and stop; do not poll. Later,
 study_status(request) collects them; jobs() lists recent and active runs (also those started in other
-conversations); cancel(request) stops them.
+conversations); cancel(request) stops them. A study's "run": {timeout_s, mem, procs, queue} sets its own time,
+memory, ranks and queueing, within the caps in study_format's status.executor.caps.
 Units: potentials eV, A (metal); force fields kcal/mol, A (real); T in K, P_bar in bar, dt_fs in fs; results in
 eV, A, GPa, K, ps, g/cm3, J/m2."""
 

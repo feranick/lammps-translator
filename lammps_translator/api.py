@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.18.6
+Version: 2026.10.20.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks (builds the structures, finds potential files; no LAMMPS run)
@@ -67,7 +67,8 @@ def validate(studies: dict) -> dict:
 def _run_one(job: dict) -> dict:
     from .runner import run_study
 
-    return run_study(job["name"], job["study"], Path(job["folder"]) / job["name"], job.get("timeout", 21600))
+    from . import executor as X_
+    return run_study(job["name"], job["study"], Path(job["folder"]) / job["name"], X_.timeout_s(job["study"]))
 
 
 class _Pool:
@@ -262,12 +263,12 @@ def run_one(request: str, name: str) -> int:
     folder = Path(request).expanduser()
     meta = json.loads((folder / "request.json").read_text())
     study = meta["studies"][name]
-    procs = int(os.environ.get("SLURM_NTASKS") or study.get("procs") or os.environ.get("LMPT_PROCS", "1"))
+    procs = int(os.environ.get("SLURM_NTASKS") or 0) or X.procs_of(study)
     try:
         job = json.loads((folder / name / "job.json").read_text())
     except (OSError, json.JSONDecodeError):
         job = {}
-    timeout = float(job.get("timeout_s") or X.timeout_s())
+    timeout = float(job.get("timeout_s") or X.timeout_s(study))
     res = run_study(name, study, folder / name, timeout, procs,
                     executor="slurm" if os.environ.get("SLURM_JOB_ID") else "by hand")
     if not res.get("ok") and "timed out" in str(res.get("why", "")):

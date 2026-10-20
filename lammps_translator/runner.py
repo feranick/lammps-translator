@@ -1,5 +1,5 @@
 """runner.py — one study end to end: build, write inputs stage by stage, run LAMMPS, read, analyse, check.
-Version: 2026.10.18.6
+Version: 2026.10.20.1
 
 Folder layout (<request>/<study>/):
     initial.data, potentials/, 00_setup/ (in.lammps, log.lammps, forces0.dump), 01_<stage>/ ..., run_all.sh,
@@ -170,6 +170,13 @@ class Study:
         res["structure"] = structure_info(self.s0)
         res["units"] = self.units
         info = lmp_info()
+        from .executor import atoms_per_rank
+        cap = max(1, -(-self.s0.n // atoms_per_rank()))
+        if self.procs > cap:
+            self.warnings.append(f"{self.procs} ranks asked for {self.s0.n} atoms: ran on {cap} "
+                                 f"(LMPT_ATOMS_PER_RANK = {atoms_per_rank()})")
+            self.procs = cap
+        res["execution"]["procs_used"] = self.procs
         res["lammps"] = {"version": info.get("version"), "exe": info.get("exe"), "procs": self.procs}
         if self.procs > 1:
             from .lammps import mpi_plan
@@ -566,9 +573,14 @@ def run_study(name: str, study: dict, folder: Path, timeout: float = 3600.0, pro
         out = {"ok": False, "name": name, "why": "invalid study", "errors": v["errors"], "warnings": v["warnings"]}
         write_json_atomic(folder / f"{name}.json", out)
         return out
-    np_ = procs or int(study.get("procs", os.environ.get("LMPT_PROCS", "1")))
+    from .executor import from_study, procs_of
+    np_ = procs or procs_of(study)
     st = Study(name, study, folder, timeout, np_)
-    st.res["execution"].update({"executor": executor, "slurm_job": os.environ.get("SLURM_JOB_ID")})
+    mem = os.environ.get("SLURM_MEM_PER_NODE")
+    st.res["execution"].update({"executor": executor, "slurm_job": os.environ.get("SLURM_JOB_ID"),
+                                "procs_requested": procs_of(study),
+                                "limits": {"timeout_s": float(timeout), "mem": f"{mem}M" if mem else None,
+                                           "from_study": from_study(study)}})
     st.warnings += v["warnings"]
     res = st.res
     try:

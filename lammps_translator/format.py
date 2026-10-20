@@ -1,5 +1,5 @@
 """format.py — the study format (what an LLM reads first) and static validation with fixable messages.
-Version: 2026.10.18.6
+Version: 2026.10.20.1
 """
 from __future__ import annotations
 
@@ -90,6 +90,7 @@ def study_format() -> dict:
             "procs": "MPI ranks (default LMPT_PROCS or 1; SLURM --ntasks)", "seed": "random seed (12345)",
             "expect": "checks", "queue": "with LMPT_EXECUTOR=slurm: true always a SLURM job, false always local "
                                          "(default: by the time estimate)",
+            "run": "{timeout_s, mem ('12G'), procs, queue}: this study's run limits, within status.executor.caps",
         },
         "system": {
             "lattice": {"kind": {**LATTICE_DOC},
@@ -511,7 +512,7 @@ def validate_study(study) -> dict:
     if not isinstance(study, dict):
         return {"ok": False, "errors": ["a study is an object {system, potential|forcefield, stages}"], "warnings": []}
     unknown = sorted(set(study) - {"system", "potential", "forcefield", "stages", "procs", "seed", "expect",
-                                   "description", "queue"})
+                                   "description", "queue", "run"})
     if unknown:
         E.append(f"study: unknown keys {unknown}")
     _check_system(study.get("system"), E, W)
@@ -544,6 +545,8 @@ def validate_study(study) -> dict:
                          "-dE/dV of its tail energy, so the minimizer's line search fails): set tail false, or use npt")
         if "lattice" in s:
             W.append("tail: corrections assume a uniform fluid beyond the cutoff; for crystals use a longer cutoff instead")
+    from .executor import check_run
+    E.extend(check_run(study))
     if "queue" in study and not isinstance(study["queue"], bool):
         E.append("queue: true (always a SLURM job) or false (always local); omit to let the time estimate decide")
     if "procs" in study and not (isinstance(study["procs"], int) and study["procs"] >= 1):

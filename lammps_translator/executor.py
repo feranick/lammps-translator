@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.18.6
+Version: 2026.10.20.1
 
 Settings (environment): LMPT_EXECUTOR local | slurm (local); LMPT_SLURM_MIN_MINUTES (1): studies estimated
 shorter run locally; LMPT_SLURM_ARGS: extra sbatch arguments; LMPT_PROCS (MPI ranks, --ntasks); LMPT_TIMEOUT
@@ -14,6 +14,11 @@ Job limits:
            2 GB; a size (8G, 8000M) as given; none: SLURM's default (on nodes with CR_Core_Memory and no DefMemPerCPU
            that is the whole node, and jobs run one at a time). A --mem* in LMPT_SLURM_ARGS wins.
   --ntasks-per-core=1 (one physical core per rank) unless LMPT_SLURM_ARGS sets the core/thread layout.
+  --ntasks min(procs, ceil(atoms / LMPT_ATOMS_PER_RANK (2000))): no more ranks than the study can use.
+
+Per study (docs/EXECUTION.md, "Per-study run settings"): "run": {timeout_s, mem, procs, queue} overrides
+LMPT_TIMEOUT (and so --time), --mem (replacing any --mem* in LMPT_SLURM_ARGS), LMPT_PROCS and the queue decision
+for that study, within LMPT_MAX_TIMEOUT, LMPT_MAX_MEM, LMPT_MAX_PROCS (unset: no cap).
 
 One SLURM job per study: <request>/<name>/job.sh (complete, rerunnable with sbatch) and job.json. States come from
 the files and the queue (squeue, then sacct, then job.log), never from in-process handles, so any server process,
@@ -43,12 +48,88 @@ def kind() -> str:
     return "slurm" if k == "slurm" else "local"
 
 
-def timeout_s() -> float:
-    return float(os.environ.get("LMPT_TIMEOUT", "21600"))
+RUN_KEYS = ("timeout_s", "mem", "procs", "queue")
 
 
-def time_limit_min() -> int:
-    return int(math.ceil(timeout_s() / 60.0)) + 10
+def run_of(study: dict | None) -> dict:
+    r = (study or {}).get("run")
+    return r if isinstance(r, dict) else {}
+
+
+def timeout_s(study: dict | None = None) -> float:
+    """The study's run.timeout_s, else LMPT_TIMEOUT (21600 s)."""
+    t = run_of(study).get("timeout_s")
+    return float(t) if t else float(os.environ.get("LMPT_TIMEOUT", "21600"))
+
+
+def time_limit_min(study: dict | None = None) -> int:
+    return int(math.ceil(timeout_s(study) / 60.0)) + 10
+
+
+def parse_mem_mb(v) -> float | None:
+    """SLURM sizes: 500M, 8G, 1T, 2048 (MB), 512K; None if malformed."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KkMmGgTt]?)[Bb]?\s*", str(v))
+    if not m:
+        return None
+    x = float(m.group(1))
+    return x * {"": 1, "k": 1 / 1024, "m": 1, "g": 1024, "t": 1024 * 1024}[m.group(2).lower()]
+
+
+def caps() -> dict:
+    """LMPT_MAX_TIMEOUT (s), LMPT_MAX_MEM (size), LMPT_MAX_PROCS: what a study's run may ask; None: no cap."""
+    def num(k):
+        v = os.environ.get(k, "").strip()
+        try:
+            return float(v) if v else None
+        except ValueError:
+            return None
+    mem = os.environ.get("LMPT_MAX_MEM", "").strip() or None
+    p = num("LMPT_MAX_PROCS")
+    return {"timeout_s": num("LMPT_MAX_TIMEOUT"), "mem": mem, "procs": int(p) if p else None}
+
+
+def check_run(study: dict) -> list[str]:
+    """Errors for a study's run block and top-level procs/queue against the caps (each names the fix)."""
+    E = []
+    r = study.get("run")
+    c = caps()
+    if r is not None:
+        if not isinstance(r, dict):
+            return ['run: an object {timeout_s, mem, procs, queue} (all optional)']
+        unknown = sorted(set(r) - set(RUN_KEYS))
+        if unknown:
+            E.append(f"run: unknown keys {unknown}; allowed {list(RUN_KEYS)} (no sbatch arguments from a study)")
+        if "timeout_s" in r:
+            t = r["timeout_s"]
+            if not (isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0):
+                E.append("run.timeout_s: seconds, a positive number")
+            elif c["timeout_s"] is not None and t > c["timeout_s"]:
+                E.append(f"run.timeout_s: {t:g} s is above LMPT_MAX_TIMEOUT ({c['timeout_s']:g} s)")
+        if "mem" in r:
+            mb = parse_mem_mb(r["mem"]) if isinstance(r["mem"], str) else None
+            if mb is None or mb <= 0:
+                E.append("run.mem: a SLURM size such as '500M', '8G' or '1T'")
+            elif c["mem"] and parse_mem_mb(c["mem"]) and mb > parse_mem_mb(c["mem"]):
+                E.append(f"run.mem: {r['mem']} is above LMPT_MAX_MEM ({c['mem']})")
+        if "procs" in r:
+            if not (isinstance(r["procs"], int) and not isinstance(r["procs"], bool) and r["procs"] >= 1):
+                E.append("run.procs: MPI ranks, an integer >= 1")
+            elif "procs" in study and study["procs"] != r["procs"]:
+                E.append(f"run.procs ({r['procs']}) disagrees with procs ({study['procs']}): give one of them")
+        if "queue" in r:
+            if not isinstance(r["queue"], bool):
+                E.append("run.queue: true (a SLURM job) or false (local)")
+            elif "queue" in study and study["queue"] != r["queue"]:
+                E.append(f"run.queue ({r['queue']}) disagrees with queue ({study['queue']}): give one of them")
+    p = r.get("procs") if isinstance(r, dict) and isinstance(r.get("procs"), int) else study.get("procs")
+    if isinstance(p, int) and c["procs"] is not None and p > c["procs"]:
+        E.append(f"{'run.procs' if isinstance(r, dict) and 'procs' in r else 'procs'}: {p} is above LMPT_MAX_PROCS "
+                 f"({c['procs']})")
+    return E
+
+
+def from_study(study: dict | None) -> list[str]:
+    return [k for k in RUN_KEYS if k in run_of(study)]
 
 
 def min_minutes() -> float:
@@ -59,8 +140,53 @@ def default_procs() -> int:
     return int(os.environ.get("LMPT_PROCS", "1"))
 
 
+def procs_of(study: dict | None) -> int:
+    """Ranks asked for: run.procs, then the study's procs, then LMPT_PROCS."""
+    r = run_of(study)
+    if r.get("procs"):
+        return int(r["procs"])
+    return int((study or {}).get("procs") or default_procs())
+
+
 def study_procs(study: dict) -> int:
-    return int(study.get("procs", default_procs()))
+    return procs_of(study)
+
+
+def atoms_per_rank() -> int:
+    return int(os.environ.get("LMPT_ATOMS_PER_RANK", "2000"))
+
+
+def ranks_for(study: dict, natoms: int | None) -> int:
+    """The size cap: min(procs, ceil(atoms / LMPT_ATOMS_PER_RANK)); procs when the atoms are not known."""
+    p = procs_of(study)
+    if not natoms:
+        return p
+    return max(1, min(p, int(math.ceil(natoms / float(atoms_per_rank())))))
+
+
+def queue_of(study: dict | None) -> bool | None:
+    r = run_of(study)
+    if "queue" in r:
+        return bool(r["queue"])
+    q = (study or {}).get("queue")
+    return q if isinstance(q, bool) else None
+
+
+def sbatch_args(study: dict | None = None) -> list[str]:
+    """LMPT_SLURM_ARGS, without --mem / --mem-per-cpu / --mem-per-gpu when the study sets run.mem."""
+    a = shlex.split(os.environ.get("LMPT_SLURM_ARGS", ""))
+    if not run_of(study).get("mem"):
+        return a
+    out, skip = [], False
+    for t in a:
+        if skip:
+            skip = False
+            continue
+        if t.startswith("--mem"):
+            skip = "=" not in t
+            continue
+        out.append(t)
+    return out
 
 
 def sbatch_path() -> str | None:
@@ -71,9 +197,11 @@ def time_mode() -> str:
     return "estimate" if os.environ.get("LMPT_SLURM_TIME", "timeout").strip().lower() == "estimate" else "timeout"
 
 
-def job_time(estimate: float | None) -> tuple[int, str]:
-    """(the job's --time in minutes, how it was chosen)."""
-    full = time_limit_min()
+def job_time(estimate: float | None, study: dict | None = None) -> tuple[int, str]:
+    """(the job's --time in minutes, how it was chosen). A study's run.timeout_s always wins."""
+    full = time_limit_min(study)
+    if run_of(study).get("timeout_s"):
+        return full, "study"
     if time_mode() == "estimate" and estimate is not None:
         f = float(os.environ.get("LMPT_SLURM_TIME_FACTOR", "3"))
         floor = int(os.environ.get("LMPT_SLURM_TIME_MIN", "20"))
@@ -85,8 +213,11 @@ def mem_setting() -> str:
     return os.environ.get("LMPT_SLURM_MEM", "auto").strip() or "auto"
 
 
-def job_mem(procs: int, natoms: int | None) -> str | None:
-    """The job's --mem value, or None (SLURM_ARGS has one, or LMPT_SLURM_MEM=none)."""
+def job_mem(procs: int, natoms: int | None, study: dict | None = None) -> str | None:
+    """The job's --mem value: the study's run.mem, else None when LMPT_SLURM_ARGS has one or LMPT_SLURM_MEM=none,
+    else LMPT_SLURM_MEM (auto: from ranks and atoms)."""
+    if run_of(study).get("mem"):
+        return str(run_of(study)["mem"])
     a = os.environ.get("LMPT_SLURM_ARGS", "")
     if "--mem" in a:
         return None
@@ -108,7 +239,9 @@ def _mem_status() -> str:
 def status() -> dict:
     out = {"kind": kind(), "sbatch": sbatch_path(), "min_minutes": min_minutes(), "procs": default_procs(),
            "time_limit_min": time_limit_min(), "time": time_mode(), "mem": _mem_status(),
-           "slurm_args": os.environ.get("LMPT_SLURM_ARGS", ""), "workers": int(os.environ.get("LMPT_WORKERS", "2"))}
+           "slurm_args": os.environ.get("LMPT_SLURM_ARGS", ""), "workers": int(os.environ.get("LMPT_WORKERS", "2")),
+           "timeout_s": timeout_s(), "atoms_per_rank": atoms_per_rank(), "caps": caps(),
+           "run_keys": "a study's run {timeout_s, mem, procs, queue} overrides these for itself, within caps"}
     if time_mode() == "estimate":
         out["time_factor"] = float(os.environ.get("LMPT_SLURM_TIME_FACTOR", "3"))
         out["time_min_min"] = int(os.environ.get("LMPT_SLURM_TIME_MIN", "20"))
@@ -167,7 +300,7 @@ def estimate_minutes(study: dict, natoms: int | None = None) -> float | None:
                 evals += 3 * 2000 * 3      # slabs are larger than the cell
             else:
                 evals += 1
-        procs = max(1, study_procs(study))
+        procs = max(1, ranks_for(study, n))
         sec = evals * n * c / (procs ** 0.85) + 2.0 * (len(study["stages"]) + 1)
         return round(sec / 60.0, 3)
     except Exception:  # noqa: BLE001
@@ -177,7 +310,7 @@ def estimate_minutes(study: dict, natoms: int | None = None) -> float | None:
 def goes_to_slurm(study: dict, estimate: float | None) -> bool:
     if kind() != "slurm":
         return False
-    q = study.get("queue")
+    q = queue_of(study)
     if q is True:
         return True
     if q is False:
@@ -221,11 +354,11 @@ def write_job(request: Path, name: str, procs: int, time_min: int | None = None,
 
 def submit(request: Path, name: str, study: dict, estimate: float | None, natoms: int | None = None) -> dict:
     """Writes job.sh, runs sbatch; job.json on success, else the study's result says why (no local fallback)."""
-    procs = study_procs(study)
-    tmin, how = job_time(estimate)
-    mem = job_mem(procs, natoms)
+    procs = ranks_for(study, natoms)
+    tmin, how = job_time(estimate, study)
+    mem = job_mem(procs, natoms, study)
     job = write_job(request, name, procs, tmin, mem)
-    cmd = ["sbatch", "--parsable", *shlex.split(os.environ.get("LMPT_SLURM_ARGS", "")), str(job)]
+    cmd = ["sbatch", "--parsable", *sbatch_args(study), str(job)]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=job.parent)
         ok = r.returncode == 0 and r.stdout.strip()
@@ -234,13 +367,15 @@ def submit(request: Path, name: str, study: dict, estimate: float | None, natoms
         ok, msg, r = False, str(exc), None
     if not ok:
         res = {"ok": False, "name": name, "state": "failed", "why": f"could not submit: {msg[:500] or 'sbatch failed'}",
-               "execution": {"executor": "slurm", "slurm_job": None, "procs_requested": procs}}
+               "execution": {"executor": "slurm", "slurm_job": None, "procs_requested": procs_of(study),
+                             "limits": {"timeout_s": timeout_s(study), "mem": mem, "from_study": from_study(study)}}}
         _atomic_json(request / name / f"{name}.json", res)
         return res
     jid = r.stdout.strip().split(";")[0].split()[0]
-    info = {"executor": "slurm", "job_id": jid, "submitted": time.time(), "procs": procs, "time_min": tmin,
-            "time_from": how, "timeout_s": (tmin - 10) * 60, "mem": mem, "estimate_min": estimate, "natoms": natoms,
-            "command": cmd}
+    tout = timeout_s(study) if how != "estimate" else (tmin - 10) * 60
+    info = {"executor": "slurm", "job_id": jid, "submitted": time.time(), "procs": procs,
+            "procs_requested": procs_of(study), "time_min": tmin, "time_from": how, "timeout_s": tout, "mem": mem,
+            "estimate_min": estimate, "natoms": natoms, "run": run_of(study), "command": cmd}
     _atomic_json(request / name / "job.json", info)
     return info
 

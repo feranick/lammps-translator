@@ -1,4 +1,4 @@
-"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.18.6
+"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.20.1
 They run anywhere; with LAMMPS (set LMPT_LMP, or lmp on the PATH) the jobs also compute real results."""
 import json
 import os
@@ -41,6 +41,9 @@ def slurm(tmp_path, monkeypatch):
     monkeypatch.setenv("LMPT_OUT", str(tmp_path / "runs"))
     monkeypatch.setenv("PYTHONPATH", f"{ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
     monkeypatch.delenv("LMPT_TIMEOUT", raising=False)
+    monkeypatch.setenv("LMPT_ATOMS_PER_RANK", "1")      # no size cap unless a test sets one
+    for k in ("LMPT_MAX_TIMEOUT", "LMPT_MAX_MEM", "LMPT_MAX_PROCS", "LMPT_SLURM_ARGS", "LMPT_SLURM_MEM", "LMPT_PROCS"):
+        monkeypatch.delenv(k, raising=False)
     return fake
 
 
@@ -291,3 +294,69 @@ def test_estimate_limit_timeout_says_what_to_change(slurm):
     assert p.returncode == 0, p.stderr
     res = json.loads((d / "md.json").read_text())
     assert res["ok"] is False and res["state"] == "timed_out" and "LMPT_SLURM_TIME=timeout" in res["why"]
+
+
+
+RUNSET = {"timeout_s": 30000, "mem": "12G", "procs": 4, "queue": True}
+
+
+def test_run_settings_override_defaults_for_that_study(slurm, monkeypatch):
+    (slurm / "hold").write_text("")
+    monkeypatch.setenv("LMPT_PROCS", "2")
+    monkeypatch.setenv("LMPT_SLURM_ARGS", "--mem=8G --nice=100")
+    r = api.run({"custom": {**LJ, "run": RUNSET}, "plain": {**LJ, "queue": True}}, wait=0)
+    req = Path(r["request"])
+    job = (req / "custom" / "job.sh").read_text()
+    info = json.loads((req / "custom" / "job.json").read_text())
+    assert "#SBATCH --time=510" in job and "#SBATCH --ntasks=4" in job and "#SBATCH --mem=12G" in job
+    assert info["command"][2:-1] == ["--nice=100"]                  # the args' --mem replaced, --nice kept
+    assert info["run"] == RUNSET and info["timeout_s"] == 30000 and info["time_from"] == "study"
+    plain = (req / "plain" / "job.sh").read_text()
+    pinfo = json.loads((req / "plain" / "job.json").read_text())
+    assert "#SBATCH --time=370" in plain and "#SBATCH --ntasks=2" in plain and "--mem" not in plain
+    assert pinfo["command"][2:-1] == ["--mem=8G", "--nice=100"] and pinfo["run"] == {}
+    s = X.status()
+    assert s["timeout_s"] == 21600 and s["caps"] == {"timeout_s": None, "mem": None, "procs": None}
+
+
+@pytest.mark.parametrize("study, word", [
+    ({**LJ, "run": {"timeout_s": 90000}}, "LMPT_MAX_TIMEOUT"),
+    ({**LJ, "run": {"mem": "64G"}}, "LMPT_MAX_MEM"),
+    ({**LJ, "run": {"procs": 40}}, "LMPT_MAX_PROCS"),
+    ({**LJ, "procs": 40}, "LMPT_MAX_PROCS"),
+    ({**LJ, "run": {"walltime": 5}}, "unknown keys"),
+    ({**LJ, "run": {"mem": "lots"}}, "run.mem"),
+    ({**LJ, "run": {"mem": "12X"}}, "run.mem"),
+    ({**LJ, "procs": 2, "run": {"procs": 4}}, "disagrees with procs"),
+    ({**LJ, "queue": False, "run": {"queue": True}}, "disagrees with queue"),
+])
+def test_run_settings_validation(slurm, monkeypatch, study, word):
+    from lammps_translator.format import validate_study
+    monkeypatch.setenv("LMPT_MAX_TIMEOUT", "43200")
+    monkeypatch.setenv("LMPT_MAX_MEM", "32G")
+    monkeypatch.setenv("LMPT_MAX_PROCS", "20")
+    v = validate_study(study)
+    assert not v["ok"] and any(word in e for e in v["errors"]), v["errors"]
+    assert validate_study({**LJ, "run": {"timeout_s": 43200, "mem": "32768M", "procs": 20}})["ok"]
+    assert X.status()["caps"] == {"timeout_s": 43200.0, "mem": "32G", "procs": 20}
+
+
+def test_size_cap_on_ranks(slurm, monkeypatch):
+    (slurm / "hold").write_text("")
+    monkeypatch.setenv("LMPT_ATOMS_PER_RANK", "50")
+    r = api.run({"lj": {**LJ, "run": {"procs": 8}}}, wait=0)            # 108 atoms: 3 ranks
+    d = Path(r["request"]) / "lj"
+    assert "#SBATCH --ntasks=3" in (d / "job.sh").read_text()
+    info = json.loads((d / "job.json").read_text())
+    assert info["procs"] == 3 and info["procs_requested"] == 8
+
+
+def test_run_by_hand_records_limits(slurm, tmp_path):
+    (slurm / "hold").write_text("")
+    r = api.run({"lj": LJ}, wait=0)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SLURM_")}
+    p = subprocess.run([sys.executable, "-m", "lammps_translator.cli", "run-study", r["request"], "lj"],
+                       capture_output=True, text=True, timeout=120, env=env)
+    assert p.returncode == 0, p.stderr
+    ex = json.loads((Path(r["request"]) / "lj" / "lj.json").read_text())["execution"]
+    assert ex["executor"] == "by hand" and ex["limits"]["timeout_s"] == 21600 and ex["limits"]["from_study"] == []
