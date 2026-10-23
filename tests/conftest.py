@@ -1,5 +1,5 @@
 """Test isolation: the machine's config/env (LMPT_EXECUTOR, LMPT_PROCS, LMPT_SLURM_*, caps) must not change what
-the tests see, and no test may submit real SLURM jobs. Version: 2026.10.20.2"""
+the tests see, and no test may submit real SLURM jobs. Version: 2026.10.22.1"""
 import os
 
 import pytest

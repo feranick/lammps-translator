@@ -1,5 +1,5 @@
 """format.py — the study format (what an LLM reads first) and static validation with fixable messages.
-Version: 2026.10.20.2
+Version: 2026.10.22.1
 """
 from __future__ import annotations
 
@@ -568,7 +568,11 @@ def validate_study(study) -> dict:
             W.extend(sysobj.warnings)
         except ValueError as exc:
             E.append(str(exc))
-    return {"ok": not E, "errors": E, "warnings": W}
+    out = {"ok": not E, "errors": E, "warnings": W}
+    if not E:
+        from .executor import sizing
+        out["estimate"] = sizing(study)
+    return out
 
 
 def validate(studies) -> dict:

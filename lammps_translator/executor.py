@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.20.2
+Version: 2026.10.22.1
 
 Settings (environment): LMPT_EXECUTOR local | slurm (local); LMPT_SLURM_MIN_MINUTES (1): studies estimated
 shorter run locally; LMPT_SLURM_ARGS: extra sbatch arguments; LMPT_PROCS (MPI ranks, --ntasks); LMPT_TIMEOUT
@@ -229,6 +229,35 @@ def job_mem(procs: int, natoms: int | None, study: dict | None = None) -> str | 
     mb = 1024 + 256 * procs + 0.004 * (natoms or 100000)
     mb = max(2048, int(math.ceil(mb / 512.0)) * 512)
     return f"{mb}M"
+
+
+def mem_mb_for(procs: int, natoms: int | None, study: dict | None = None) -> int:
+    """The memory a study's job reserves, in MB: run.mem, else a --mem / --mem-per-cpu in LMPT_SLURM_ARGS, else
+    LMPT_SLURM_MEM (a size, or auto: from ranks and atoms; with none, the auto value as what it needs)."""
+    m = job_mem(procs, natoms, study)
+    if m is None:
+        for t in shlex.split(os.environ.get("LMPT_SLURM_ARGS", "")):
+            if t.startswith("--mem-per-cpu="):
+                v = parse_mem_mb(t.split("=", 1)[1])
+                if v:
+                    return int(math.ceil(v * procs))
+            elif t.startswith("--mem="):
+                v = parse_mem_mb(t.split("=", 1)[1])
+                if v:
+                    return int(math.ceil(v))
+        mb = 1024 + 256 * procs + 0.004 * (natoms or 100000)
+        return max(2048, int(math.ceil(mb / 512.0)) * 512)
+    v = parse_mem_mb(m)
+    return int(math.ceil(v)) if v else 2048
+
+
+def sizing(study: dict) -> dict:
+    """What a study's run is sized as, before running: {'minutes' (upper estimate with these ranks), 'procs'
+    (ranks after the size cap), 'mem_mb'} — the same numbers submit() puts in job.sh. For validate_studies
+    (llm-translators' router places runs with them)."""
+    e = estimate(study)
+    procs = ranks_for(study, e["natoms"])
+    return {"minutes": e["minutes"], "procs": procs, "mem_mb": mem_mb_for(procs, e["natoms"], study)}
 
 
 def _mem_status() -> str:

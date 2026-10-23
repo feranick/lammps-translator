@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run atomistic studies with LAMMPS.
-Version: 2026.10.20.2
+Version: 2026.10.22.1
 
 Tools (all JSON):
   study_format      the study format: systems, potentials, force fields, stages. Read it first.
@@ -62,7 +62,8 @@ def study_format() -> dict:
 @server.tool()
 def validate_studies(studies: dict) -> dict:
     """Static checks of studies given as {name: study}: builds each structure and finds its potential files.
-    Returns per study ok, errors (each says what to fix), warnings."""
+    Returns per study ok, errors (each says what to fix), warnings, and for a valid study its estimate
+    {minutes (an upper bound with procs ranks), procs (after the size cap), mem_mb}: what its SLURM job would ask."""
     return api.validate(studies)
 
 

@@ -1,4 +1,4 @@
-"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.20.2
+"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.22.1
 They run anywhere; with LAMMPS (set LMPT_LMP, or lmp on the PATH) the jobs also compute real results."""
 import json
 import os
@@ -360,3 +360,26 @@ def test_run_by_hand_records_limits(slurm, tmp_path):
     assert p.returncode == 0, p.stderr
     ex = json.loads((Path(r["request"]) / "lj" / "lj.json").read_text())["execution"]
     assert ex["executor"] == "by hand" and ex["limits"]["timeout_s"] == 21600 and ex["limits"]["from_study"] == []
+
+
+def test_validation_estimates_match_the_job(slurm, monkeypatch):
+    from lammps_translator.format import validate
+    (slurm / "hold").write_text("")
+    monkeypatch.setenv("LMPT_ATOMS_PER_RANK", "50")
+    monkeypatch.setenv("LMPT_PROCS", "8")
+    md = {**LJ, "stages": [{"kind": "nvt", "T": 30, "steps": 100000}]}
+    studies = {"md": md, "mem": {**md, "run": {"mem": "12G", "procs": 2}}}
+    v = validate(studies)["studies"]
+    e = v["md"]["estimate"]
+    assert set(e) == {"minutes", "procs", "mem_mb"} and e["procs"] == 3 and e["minutes"] > 0   # 108 atoms / 50
+    assert e["mem_mb"] == 2048 and v["mem"]["estimate"] == {**v["mem"]["estimate"], "procs": 2, "mem_mb": 12288}
+    r = api.run(studies, wait=0)
+    for n in studies:
+        info = json.loads((Path(r["request"]) / n / "job.json").read_text())
+        assert info["procs"] == v[n]["estimate"]["procs"] and info["estimate_min"] == v[n]["estimate"]["minutes"]
+        assert X.parse_mem_mb(info["mem"]) == v[n]["estimate"]["mem_mb"]
+    monkeypatch.setenv("LMPT_SLURM_ARGS", "--mem=6000M --nice=5")
+    assert validate({"md": md})["studies"]["md"]["estimate"]["mem_mb"] == 6000
+    monkeypatch.setenv("LMPT_SLURM_ARGS", "--mem-per-cpu=1G")
+    assert validate({"md": md})["studies"]["md"]["estimate"]["mem_mb"] == 3 * 1024
+    assert "estimate" not in validate({"bad": {**LJ, "run": {"walltime": 1}}})["studies"]["bad"]

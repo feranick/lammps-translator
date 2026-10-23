@@ -1,5 +1,5 @@
 """data.py — tables: element masses, lattices, built-in molecules (with their force fields), unit constants.
-Version: 2026.10.20.2
+Version: 2026.10.22.1
 """
 from __future__ import annotations
 
