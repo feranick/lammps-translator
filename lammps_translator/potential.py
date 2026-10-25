@@ -1,5 +1,5 @@
 """potential.py — interactions: potential files, force-field typing, and the LAMMPS commands that set them.
-Version: 2026.10.25.1
+Version: 2026.10.25.2
 
 Every pair coefficient is written explicitly (mixing done here, not by LAMMPS), so the reference implementation
 uses the same numbers. 'model' (from model()) is the normalised description refcalc.py evaluates.

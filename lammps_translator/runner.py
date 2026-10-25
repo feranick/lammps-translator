@@ -1,5 +1,5 @@
 """runner.py — one study end to end: build, write inputs stage by stage, run LAMMPS, read, analyse, check.
-Version: 2026.10.25.1
+Version: 2026.10.25.2
 
 Folder layout (<request>/<study>/):
     initial.data, potentials/, 00_setup/ (in.lammps, log.lammps, forces0.dump), 01_<stage>/ ..., run_all.sh,

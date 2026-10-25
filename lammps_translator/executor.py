@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.25.1
+Version: 2026.10.25.2
 
 Settings (environment): LMPT_EXECUTOR local | slurm (local); LMPT_SLURM_MIN_MINUTES (1): studies estimated
 shorter run locally; LMPT_SLURM_ARGS: extra sbatch arguments; LMPT_PROCS (MPI ranks, --ntasks); LMPT_TIMEOUT
@@ -418,13 +418,17 @@ def _my_addresses() -> set[str]:
     return addrs
 
 
+def _hostname() -> str:
+    import socket
+    return socket.gethostname()
+
+
 def this_node(nodes: list[dict] | None = None) -> dict | None:
     """The cluster node that is this machine: host name = NodeName or NodeHostName, else an address = NodeAddr."""
     nodes = cluster_nodes() if nodes is None else nodes
     if not nodes:
         return None
-    import socket
-    h = socket.gethostname()
+    h = _hostname()
     names = {h, h.split(".")[0]}
     for n in nodes:
         if n["name"] in names or n["hostname"] in names or n["hostname"].split(".")[0] in names:

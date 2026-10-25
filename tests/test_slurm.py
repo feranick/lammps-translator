@@ -1,4 +1,4 @@
-"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.25.1
+"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.25.2
 They run anywhere; with LAMMPS (set LMPT_LMP, or lmp on the PATH) the jobs also compute real results."""
 import json
 import os
@@ -394,7 +394,8 @@ SPARKS = [{"name": "spark-5da5", "hostname": "spark-5da5", "addr": "100.77.175.9
 
 def _two_nodes(slurm, monkeypatch, me_addr="100.76.107.42"):
     (slurm / "nodes.json").write_text(json.dumps(SPARKS))
-    monkeypatch.setattr(X, "_my_addresses", lambda: {"127.0.0.1", me_addr})   # host name matches neither
+    monkeypatch.setattr(X, "_my_addresses", lambda: {"127.0.0.1", me_addr})
+    monkeypatch.setattr(X, "_hostname", lambda: "lmpt-test-host")     # matches neither, even on a Spark
     X.forget_nodes()
 
 

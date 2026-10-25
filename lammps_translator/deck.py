@@ -1,5 +1,5 @@
 """deck.py — LAMMPS input scripts, one per stage, written from the current state just before the stage runs.
-Version: 2026.10.25.1
+Version: 2026.10.25.2
 
 Every number the post-processing needs is printed by LAMMPS as a tagged line
     LMPT <tag> pe <v> pxx <v> ... (thermo keywords, %.15g)

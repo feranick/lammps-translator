@@ -1,4 +1,4 @@
-"""fakeslurm.py — stand-ins for sbatch, squeue, scancel, sacct and sinfo (tests only). Version: 2026.10.25.1
+"""fakeslurm.py — stand-ins for sbatch, squeue, scancel, sacct and sinfo (tests only). Version: 2026.10.25.2
 
 State in $FAKE_SLURM/state.json. sbatch starts job.sh in the background (or holds it PENDING when the file
 $FAKE_SLURM/hold exists, and fails when $FAKE_SLURM/fail_submit exists); squeue reports RUNNING while the process
@@ -136,7 +136,7 @@ def scontrol(args):
     calls = D / "scontrol_calls"
     calls.write_text(str(int(calls.read_text()) + 1 if calls.exists() else 1))
     import socket
-    f = D / "nodes.json"
+    f = D / "nodes.json"            # the default node is this host, whatever its name
     nodes = json.loads(f.read_text()) if f.exists() else [
         {"name": socket.gethostname(), "hostname": socket.gethostname(), "addr": "10.0.0.1", "cpus": 128, "tpc": 2}]
     for n in nodes:

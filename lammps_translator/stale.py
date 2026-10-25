@@ -1,5 +1,5 @@
 """stale.py — a server that runs older code than what is installed (llm-translators docs/SHARED.md).
-Version: 2026.10.25.1
+Version: 2026.10.25.2
 
 A shared install has <prefix>/releases/<name>/ (with RELEASE.json) and <prefix>/current -> releases/<name>; a server
 keeps the release it started from. It is stale when `current` points to another release (or, in a checkout, when
