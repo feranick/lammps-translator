@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.22.1
+Version: 2026.10.25.1
 
 Settings (environment): LMPT_EXECUTOR local | slurm (local); LMPT_SLURM_MIN_MINUTES (1): studies estimated
 shorter run locally; LMPT_SLURM_ARGS: extra sbatch arguments; LMPT_PROCS (MPI ranks, --ntasks); LMPT_TIMEOUT
@@ -19,6 +19,11 @@ Job limits:
 Per study (docs/EXECUTION.md, "Per-study run settings"): "run": {timeout_s, mem, procs, queue} overrides
 LMPT_TIMEOUT (and so --time), --mem (replacing any --mem* in LMPT_SLURM_ARGS), LMPT_PROCS and the queue decision
 for that study, within LMPT_MAX_TIMEOUT, LMPT_MAX_MEM, LMPT_MAX_PROCS (unset: no cap).
+
+Clusters of several nodes: LMPT_SLURM_NODE = local (default: --nodelist=<this node> when scontrol lists more than
+one node, because run folders are in this machine's home) | any (SLURM chooses: shared homes) | a node list. A
+--nodelist / -w in LMPT_SLURM_ARGS wins. Ranks are capped at that node's physical cores. scontrol, sinfo and squeue
+results that failed are asked again next time (a controller that was down is not remembered as "no SLURM").
 
 One SLURM job per study: <request>/<name>/job.sh (complete, rerunnable with sbatch) and job.json. States come from
 the files and the queue (squeue, then sacct, then job.log), never from in-process handles, so any server process,
@@ -157,10 +162,14 @@ def atoms_per_rank() -> int:
 
 
 def ranks_for(study: dict, natoms: int | None) -> int:
-    """The size cap: min(procs, ceil(atoms / LMPT_ATOMS_PER_RANK)); procs when the atoms are not known."""
+    """The size cap: min(procs, ceil(atoms / LMPT_ATOMS_PER_RANK), this node's physical cores); procs (capped at
+    the cores) when the atoms are not known. Jobs ask for one rank per core (--ntasks-per-core=1)."""
     p = procs_of(study)
+    cores = node_cores()
+    if cores:
+        p = min(p, cores)
     if not natoms:
-        return p
+        return max(1, p)
     return max(1, min(p, int(math.ceil(natoms / float(atoms_per_rank())))))
 
 
@@ -174,7 +183,7 @@ def queue_of(study: dict | None) -> bool | None:
 
 def sbatch_args(study: dict | None = None) -> list[str]:
     """LMPT_SLURM_ARGS, without --mem / --mem-per-cpu / --mem-per-gpu when the study sets run.mem."""
-    a = shlex.split(os.environ.get("LMPT_SLURM_ARGS", ""))
+    a = slurm_args_tokens()
     if not run_of(study).get("mem"):
         return a
     out, skip = [], False
@@ -218,8 +227,7 @@ def job_mem(procs: int, natoms: int | None, study: dict | None = None) -> str | 
     else LMPT_SLURM_MEM (auto: from ranks and atoms)."""
     if run_of(study).get("mem"):
         return str(run_of(study)["mem"])
-    a = os.environ.get("LMPT_SLURM_ARGS", "")
-    if "--mem" in a:
+    if _has_opt(slurm_args_tokens(), "--mem", "--mem-per-cpu", "--mem-per-gpu"):
         return None
     m = mem_setting()
     if m.lower() == "none":
@@ -236,7 +244,7 @@ def mem_mb_for(procs: int, natoms: int | None, study: dict | None = None) -> int
     LMPT_SLURM_MEM (a size, or auto: from ranks and atoms; with none, the auto value as what it needs)."""
     m = job_mem(procs, natoms, study)
     if m is None:
-        for t in shlex.split(os.environ.get("LMPT_SLURM_ARGS", "")):
+        for t in slurm_args_tokens():
             if t.startswith("--mem-per-cpu="):
                 v = parse_mem_mb(t.split("=", 1)[1])
                 if v:
@@ -261,7 +269,7 @@ def sizing(study: dict) -> dict:
 
 
 def _mem_status() -> str:
-    a = [t for t in shlex.split(os.environ.get("LMPT_SLURM_ARGS", "")) if t.startswith("--mem")]
+    a = [t for t in slurm_args_tokens() if t.startswith("--mem")]
     return f"{a[0]} (from LMPT_SLURM_ARGS)" if a else mem_setting()
 
 
@@ -271,6 +279,11 @@ def status() -> dict:
            "slurm_args": os.environ.get("LMPT_SLURM_ARGS", ""), "workers": int(os.environ.get("LMPT_WORKERS", "2")),
            "timeout_s": timeout_s(), "atoms_per_rank": atoms_per_rank(), "caps": caps(),
            "run_keys": "a study's run {timeout_s, mem, procs, queue} overrides these for itself, within caps"}
+    plan = node_plan()
+    out["node"] = {k: plan.get(k) for k in ("setting", "nodelist", "cluster_nodes", "this_node")}
+    out["node"]["cores"] = node_cores()
+    if plan.get("warning"):
+        out["node"]["warning"] = plan["warning"]
     if time_mode() == "estimate":
         out["time_factor"] = float(os.environ.get("LMPT_SLURM_TIME_FACTOR", "3"))
         out["time_min_min"] = int(os.environ.get("LMPT_SLURM_TIME_MIN", "20"))
@@ -347,6 +360,169 @@ def goes_to_slurm(study: dict, estimate: float | None) -> bool:
     return estimate is None or estimate >= min_minutes()
 
 
+# ------------------------------------------------------------------------------------------- cluster nodes
+_NODES_CACHE: dict = {}
+
+
+def forget_nodes() -> None:
+    """Drops the kept SLURM answers (node list, pending order)."""
+    _NODES_CACHE.clear()
+    _PENDING.clear()
+
+
+def cluster_nodes() -> list[dict] | None:
+    """The SLURM cluster's nodes from 'scontrol -o show node' (name, hostname, addr, cpus, threads per core,
+    cores); None when scontrol fails. A success is kept 60 s; a failure only 5 s (within one tool call, so a
+    controller that does not answer costs one timeout per call), then it is asked again."""
+    c = _NODES_CACHE.get("v")
+    if c and time.time() - c[0] < 60:
+        return c[1]
+    f = _NODES_CACHE.get("failed")
+    if f and time.time() - f < 5:          # one tool call asks once; the next call (seconds later) asks again
+        return None
+    rc, out, _ = _run(["scontrol", "-o", "show", "node"], timeout=10)
+    if rc != 0 or not out.strip():
+        _NODES_CACHE["failed"] = time.time()
+        return None
+    _NODES_CACHE.pop("failed", None)
+    nodes = []
+    for ln in out.splitlines():
+        kv = dict(re.findall(r"(\w+)=(\S*)", ln))
+        if "NodeName" not in kv:
+            continue
+        def num(k, d=0):
+            try:
+                return int(kv.get(k, d))
+            except ValueError:
+                return d
+        cpus = num("CPUTot")
+        tpc = max(1, num("ThreadsPerCore", 1))
+        cores = num("CoresPerSocket") * max(1, num("Sockets", 1)) * max(1, num("Boards", 1)) or (cpus // tpc)
+        nodes.append({"name": kv["NodeName"], "hostname": kv.get("NodeHostName", kv["NodeName"]),
+                      "addr": kv.get("NodeAddr", ""), "cpus": cpus, "threads_per_core": tpc,
+                      "cores": min(cores, cpus // tpc) if cpus else cores, "state": kv.get("State", "")})
+    _NODES_CACHE["v"] = (time.time(), nodes)
+    return nodes
+
+
+def _my_addresses() -> set[str]:
+    addrs = set()
+    rc, out, _ = _run(["hostname", "-I"], timeout=5)
+    if rc == 0:
+        addrs.update(out.split())
+    try:
+        import socket
+        addrs.update(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    return addrs
+
+
+def this_node(nodes: list[dict] | None = None) -> dict | None:
+    """The cluster node that is this machine: host name = NodeName or NodeHostName, else an address = NodeAddr."""
+    nodes = cluster_nodes() if nodes is None else nodes
+    if not nodes:
+        return None
+    import socket
+    h = socket.gethostname()
+    names = {h, h.split(".")[0]}
+    for n in nodes:
+        if n["name"] in names or n["hostname"] in names or n["hostname"].split(".")[0] in names:
+            return n
+    addrs = _my_addresses()
+    for n in nodes:
+        if n["addr"] and n["addr"] in addrs:
+            return n
+    return None
+
+
+def node_setting() -> str:
+    return os.environ.get("LMPT_SLURM_NODE", "local").strip() or "local"
+
+
+def _args_nodelist(tokens: list[str]) -> str | None:
+    for i, t in enumerate(tokens):
+        if t.startswith("--nodelist="):
+            return t.split("=", 1)[1]
+        if t in ("--nodelist", "-w") and i + 1 < len(tokens):
+            return tokens[i + 1]
+        if t.startswith("-w") and len(t) > 2:
+            return t[2:].lstrip("=")
+    return None
+
+
+def node_plan() -> dict:
+    """{'setting', 'nodelist' (what the job asks for; None: SLURM chooses), 'cluster_nodes', 'this_node',
+    'from' (args | local | list | any), 'warning'?}. A --nodelist / -w in LMPT_SLURM_ARGS wins."""
+    setting = node_setting()
+    nodes = cluster_nodes()
+    me = this_node(nodes) if nodes else None
+    out = {"setting": setting, "nodelist": None, "cluster_nodes": len(nodes) if nodes is not None else None,
+           "this_node": me["name"] if me else None}
+    given = _args_nodelist(slurm_args_tokens())
+    if given:
+        out.update({"nodelist": given, "from": "LMPT_SLURM_ARGS"})
+        return out
+    if setting == "any":
+        out["from"] = "any"
+        return out
+    if setting != "local":
+        out.update({"nodelist": setting, "from": "list"})
+        return out
+    out["from"] = "local"
+    if nodes is None:
+        return out
+    if len(nodes) > 1:
+        if me:
+            out["nodelist"] = me["name"]
+        else:
+            out["warning"] = ("LMPT_SLURM_NODE=local, but this machine is none of the cluster's nodes (by host name "
+                              "or address): jobs are not pinned and may run on another node; set LMPT_SLURM_NODE")
+    return out
+
+
+def node_cores() -> int | None:
+    """Physical cores of the node the jobs run on (this node; with a node list or 'any', the smallest of them),
+    from SLURM; without SLURM, this machine's cores. None if unknown."""
+    if kind() == "slurm":
+        nodes = cluster_nodes()
+        if nodes:
+            plan = node_plan()
+            if plan["nodelist"]:
+                names = set(_expand_nodelist(plan["nodelist"]))
+                sel = [n for n in nodes if n["name"] in names] or nodes
+            else:
+                me = this_node(nodes)
+                sel = [me] if (me and plan["setting"] == "local") else nodes
+            cores = [n["cores"] for n in sel if n.get("cores")]
+            if cores:
+                return min(cores)
+    try:
+        from .lammps import cpu_topology
+        return cpu_topology()["cores"] or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _expand_nodelist(s: str) -> list[str]:
+    """'a,b' and simple ranges 'node[1-3,5]' (enough for the names we compare)."""
+    out = []
+    for part in re.findall(r"[^,\[]+(?:\[[^\]]*\])?", s):
+        m = re.fullmatch(r"(.*)\[(.*)\]", part)
+        if not m:
+            out.append(part)
+            continue
+        pre, body = m.groups()
+        for r in body.split(","):
+            if "-" in r:
+                a, b = r.split("-", 1)
+                w = len(a)
+                out += [f"{pre}{i:0{w}d}" for i in range(int(a), int(b) + 1)]
+            else:
+                out.append(pre + r)
+    return out
+
+
 # ------------------------------------------------------------------------------------------- submit
 def _atomic_json(path: Path, obj) -> None:
     tmp = path.with_name(path.name + f".tmp{os.getpid()}")
@@ -354,14 +530,31 @@ def _atomic_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
+def slurm_args_tokens() -> list[str]:
+    """LMPT_SLURM_ARGS split as a shell would (it may hold several options, e.g. '--mem=8G --nodelist=x')."""
+    try:
+        return shlex.split(os.environ.get("LMPT_SLURM_ARGS", ""))
+    except ValueError:
+        return os.environ.get("LMPT_SLURM_ARGS", "").split()
+
+
+def _has_opt(tokens: list[str], *names: str) -> bool:
+    """Whether an option is among the tokens: --name, --name=value, or a short -x / -xvalue."""
+    for t in tokens:
+        for n in names:
+            if t == n or (n.startswith("--") and t.startswith(n + "=")) or (len(n) == 2 and t.startswith(n)):
+                return True
+    return False
+
+
 def _whole_cores() -> bool:
     """One physical core per rank (--ntasks-per-core=1), unless LMPT_SLURM_ARGS says otherwise. LMPT_PROCS is
     sized in physical cores (llmt tune), and Open MPI binds ranks to cores."""
-    a = os.environ.get("LMPT_SLURM_ARGS", "")
-    return not any(k in a for k in ("--hint", "--threads-per-core", "--ntasks-per-core", "--cpus-per-task"))
+    return not _has_opt(slurm_args_tokens(), "--hint", "--threads-per-core", "--ntasks-per-core", "--cpus-per-task")
 
 
-def write_job(request: Path, name: str, procs: int, time_min: int | None = None, mem: str | None = None) -> Path:
+def write_job(request: Path, name: str, procs: int, time_min: int | None = None, mem: str | None = None,
+              nodelist: str | None = None) -> Path:
     d = request / name
     d.mkdir(parents=True, exist_ok=True)
     lines = ["#!/bin/bash",
@@ -372,6 +565,7 @@ def write_job(request: Path, name: str, procs: int, time_min: int | None = None,
              *(["#SBATCH --ntasks-per-core=1"] if _whole_cores() else []),
              f"#SBATCH --time={time_min or time_limit_min()}",
              *([f"#SBATCH --mem={mem}"] if mem else []),
+             *([f"#SBATCH --nodelist={nodelist}"] if nodelist else []),
              "#SBATCH --export=ALL",
              f"exec {shlex.quote(sys.executable)} -m lammps_translator.cli run-study {shlex.quote(str(request))} "
              f"{shlex.quote(name)}"]
@@ -386,10 +580,12 @@ def submit(request: Path, name: str, study: dict, estimate: float | None, natoms
     procs = ranks_for(study, natoms)
     tmin, how = job_time(estimate, study)
     mem = job_mem(procs, natoms, study)
-    job = write_job(request, name, procs, tmin, mem)
+    plan = node_plan()
+    nodelist = plan["nodelist"] if plan.get("from") in ("local", "list") else None   # args' own -w stays in args
+    job = write_job(request, name, procs, tmin, mem, nodelist)
     cmd = ["sbatch", "--parsable", *sbatch_args(study), str(job)]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=job.parent)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20, cwd=job.parent)
         ok = r.returncode == 0 and r.stdout.strip()
         msg = (r.stderr or r.stdout).strip()
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -404,13 +600,14 @@ def submit(request: Path, name: str, study: dict, estimate: float | None, natoms
     tout = timeout_s(study) if how != "estimate" else (tmin - 10) * 60
     info = {"executor": "slurm", "job_id": jid, "submitted": time.time(), "procs": procs,
             "procs_requested": procs_of(study), "time_min": tmin, "time_from": how, "timeout_s": tout, "mem": mem,
-            "estimate_min": estimate, "natoms": natoms, "run": run_of(study), "command": cmd}
+            "estimate_min": estimate, "natoms": natoms, "run": run_of(study), "nodelist": plan["nodelist"],
+            "command": cmd}
     _atomic_json(request / name / "job.json", info)
     return info
 
 
 # ------------------------------------------------------------------------------------------- queue
-def _run(cmd: list[str], timeout: float = 30) -> tuple[int, str, str]:
+def _run(cmd: list[str], timeout: float = 10) -> tuple[int, str, str]:
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout, r.stderr
@@ -446,9 +643,16 @@ def queue() -> dict | None:
     return q
 
 
+_PENDING: dict = {}
+
+
 def _ahead(jid: str) -> int | None:
     """Pending jobs (anyone's) that SLURM will consider first: higher priority, then earlier job id.
-    (squeue's own listing order is not the scheduling order.)"""
+    (squeue's own listing order is not the scheduling order.) One squeue call serves a few seconds of states."""
+    c = _PENDING.get("v")
+    if c and time.time() - c[0] < 3:
+        ids = c[1]
+        return ids.index(jid) if jid in ids else None
     rc, out, _ = _run(["squeue", "-h", "-t", "PENDING", "-o", "%i|%Q"])
     if rc != 0:
         return None
@@ -462,6 +666,7 @@ def _ahead(jid: str) -> int | None:
                 continue
     jobs.sort()
     ids = [j[2] for j in jobs]
+    _PENDING["v"] = (time.time(), ids)
     return ids.index(jid) if jid in ids else None
 
 
@@ -547,6 +752,12 @@ def study_state(request: Path, name: str, q: dict | None) -> dict:
         except json.JSONDecodeError:
             pass
     if not jid:
+        try:
+            age = time.time() - json.loads((request / "request.json").read_text()).get("started", 0)
+        except (OSError, json.JSONDecodeError):
+            age = 1e9
+        if age < 600:
+            return {"state": "queued", "reason": "submitting"}
         return {"state": "failed", "why": "no job.json and no result (submission did not finish?)"}
     if q is None:
         return {"state": "unknown", "job_id": jid, "why": "squeue failed: cannot tell the job's state now"}

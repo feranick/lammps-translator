@@ -53,6 +53,7 @@ A deterministic **translator + checker** for LLMs: the LLM writes a structured s
 
 ## State
 
+- 2026.10.25.1: EXECUTION.md "Clusters of several nodes" (LMPT_SLURM_NODE), shlex parsing of LMPT_SLURM_ARGS, SHARED.md stale servers (stale.py, as cfdt 2026.10.25.4), failures not cached (scontrol, lmp -h, mpi flavour), tools in worker threads within wait_s (run_benchmarks + bench_status). Estimates in validation were already in 2026.10.22.1. 75 tests here. Not yet on the Sparks.
 - 2026.10.22.1: estimates in validate_studies (executor.sizing) for the router. 63 tests.
 - 2026.10.20.1: per-study `run` settings and LMPT_MAX_* caps (EXECUTION.md "Per-study run settings", as cfdt 2026.10.20.1); ranks capped at atoms/LMPT_ATOMS_PER_RANK (EXECUTION.md "Sizing jobs"). 62 tests here. Not done from that section: run_benchmarks returning without waiting + bench_status(bench) (cfdt, feat have it; lmpt's run_benchmarks waits up to 45 s and takes request=...); a measured LMPT_ATOMS_PER_RANK on mochi.
 - 2026.10.18.6 (status shows LMPT_SLURM_ARGS --mem). Mochi via MCP: jobs 2516/2517 side by side, 9 cores each, reliable; check_local stayed local; config/env there has LMPT_SLURM_ARGS=--mem=8G (overrides auto).

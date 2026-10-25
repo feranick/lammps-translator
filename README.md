@@ -15,7 +15,7 @@ cd ~/Software && git clone https://github.com/feranick/lammps-translator.git    
 source ~/Software/build123d-translator/.venv/bin/activate                          # shared venv (alias cad)
 pip install -e "$HOME/Software/lammps-translator[mcp,test]"
 lmpt status            # LAMMPS found? version, packages, potentials folders, fea-translator
-pytest -q              # 63 tests: 53 run anywhere (SLURM ones with fake sbatch/squeue), 10 need LAMMPS
+pytest -q              # 75 tests: 64 run anywhere (SLURM ones with fake sbatch/squeue/scontrol), 11 need LAMMPS
 lmpt bench             # benchmarks (~17 s); slow ones by name: lmpt bench spce_water (~9 min, run it from the shell)
 ```
 
@@ -58,9 +58,14 @@ With `LMPT_EXECUTOR=slurm` (in llm-translators' `config/env`), each long study i
 - **Run record.** Every result has `execution` (docs/EXECUTION.md): `executor` (`slurm`, `local`, `by hand`), `slurm_job`, `procs_requested`, `procs_used`, `mpi` {`launch`, `binding`, `cores`, `hwthreads`} (null for one rank), and `limits` {`timeout_s`, `mem` (the job's, from `SLURM_MEM_PER_NODE`, e.g. `12288M`; null locally), `from_study` (the `run` keys the study set)}. Results that end without running carry `executor` and `slurm_job`.
 - **States.** `study_status` keeps its shape; a pending study's `progress` has `state`: `queued` (`reason`, `expected_start`, `ahead`), `running` (stage, MD steps, `eta_min_max`, `job_elapsed_min`). They come from the files and one `squeue` call, so any server process, after restarts or from another chat, can collect them. A job that leaves the queue without a result ends as `timed_out`, `out_of_memory`, `cancelled` or `failed` (from `sacct`, or from `job.log` when there is no accounting), with `ok: false` and what to change.
 - **`jobs` and `cancel`.** `jobs(limit, active)` lists the newest requests with jobs, the queue (`running`, `queued`, `cpus_in_use` of `lmpt:` jobs) and the machine (`sinfo` CPUs). `cancel(request, names)` runs `scancel`; in local mode it stops a study only if this server process runs it.
-- **Benchmarks** go through the same path (`lmpt bench --queue`: every case as a job): `lmpt bench` waits for them; the MCP tool returns pending cases with a `request` to pass back as `run_benchmarks(request=...)`.
+- **Benchmarks** go through the same path, in the worker pool or as SLURM jobs (`lmpt bench --queue`: every case as a job): `lmpt bench` waits for them; the MCP tool `run_benchmarks` submits and returns within `wait_s`, and `bench_status(bench)` evaluates the cases that have finished (the fea-translator chain runs its FEA in a background thread).
+- **Clusters of several nodes** (docs/EXECUTION.md). `LMPT_SLURM_NODE`: `local` (default) adds `--nodelist=<this node>` to every job when `scontrol -o show node` lists more than one node, because the run folder is only in this machine's home (the DGX Sparks spark-5da5 and spark-0808 share no home). *This node* is the one whose `NodeName`/`NodeHostName` is the host name, else whose `NodeAddr` is one of this machine's addresses (`hostname -I`). `any`: SLURM chooses (shared homes). A node list: those nodes. A `--nodelist` or `-w` in `LMPT_SLURM_ARGS` wins (it stays in the sbatch arguments). Ranks are capped at that node's physical cores (CPUs / threads per core), not the cluster's; without SLURM, at this machine's cores. `job.json` records `nodelist`.
+- **Settings parsing.** `LMPT_SLURM_ARGS` may hold several options (`--mem=8G --nodelist=spark-5da5`); it is split as a shell does (`shlex`), and options are matched as tokens: a `--mem…` there wins over `LMPT_SLURM_MEM`, a `--nodelist`/`-w` over `LMPT_SLURM_NODE`, a `--hint`/`--threads-per-core`/`--ntasks-per-core`/`--cpus-per-task` over the one-rank-per-core default.
+- **No remembered failures.** A failed `scontrol` (a controller that is down) is asked again on the next call (kept 5 s, so one call asks once); a success is kept 60 s. A failed `lmp -h` or an unknown MPI flavour is asked again too. `squeue`, `sinfo` and `sacct` are never cached beyond a few seconds.
+- **Within wait_s.** Every MCP tool returns within its `wait_s` (at most 50 s): LAMMPS runs only in pool workers or SLURM jobs; each tool runs in a worker thread, off the server's event loop, so one waiting call does not block others or pings; `run_studies` submits within about 60 % of its `wait_s` and leaves the rest to a background thread (those studies show `queued`, `submitting`); SLURM commands have 10-20 s timeouts.
+- **Stale servers** (docs/SHARED.md, as omct 2026.10.23.3 and cfdt 2026.10.25.4). A server started by `main()` from a shared release (`<prefix>/releases/<name>/` with `RELEASE.json`) notices when `<prefix>/current` points to another release (in a checkout: when `__init__.py` carries another version). While idle (no other call, no study in its worker pool) it refuses a call with a ToolError containing `STALE_SERVER` and exits; llm-translators' router repeats the call on a new server. An idle stale server also exits by itself within 20 s (`LMPT_STALE_CHECK_S`); a busy one answers with a `server_stale` note and exits once idle. `LMPT_EXIT_WHEN_STALE`: `1` always, `0` never, default shared releases only. Tests and `lmpt run-study` in a release that is not current yet run normally.
 - **Tested** on carbonio (12 CPUs, 6 cores × 2 threads, LAMMPS 4 Jul 2026, Open MPI 5), 2026.10.18.3: `madelung_nacl` as job 5515 (pass); a 2-rank NVT study as job 5516: whole cores (then `--hint=nomultithread`) gave 2 physical cores (4 CPUs in SLURM's count), Open MPI's default binding, `reliable: true`, mean T 39.8 K for 40 K; `jobs` showed it running with stage and ETA, then done. On mochi (40 CPUs, 20 cores × 2 threads), where 2026.10.18.1 failed with Open MPI's 'allocation-overload': `madelung_nacl` as job 2482 (pass); a 9-rank NVT study as job 2483: 9 physical cores (18 hardware threads), default binding, `reliable: true`, 12.8 s.
-- `lmpt status` (`tool_status`) reports `executor: {kind, sbatch, min_minutes, procs, time_limit_min, time, mem, slurm_args, workers, timeout_s, atoms_per_rank, caps: {timeout_s, mem, procs}}` (+ `time_factor`, `time_min_min` with `time: estimate`). `study_format` includes it, so a model sees the defaults and caps before it writes a `run`.
+- `lmpt status` (`tool_status`) reports `executor: {kind, sbatch, min_minutes, procs, time_limit_min, time, mem, slurm_args, workers, timeout_s, atoms_per_rank, caps: {timeout_s, mem, procs}}` (+ `time_factor`, `time_min_min` with `time: estimate`). `study_format` includes it, so a model sees the defaults and caps before it writes a `run`. With clusters: `node: {setting, nodelist (null when SLURM may choose), cluster_nodes, this_node, cores}` (+ `warning` when `local` cannot find this machine among the nodes).
 
 ## A study
 
@@ -152,7 +157,7 @@ Per stage under its name (default: its kind; repeats get `_2`), plus `structure`
 
 ## For LLM tools: the MCP server
 
-Tools: `study_format`, `validate_studies`, `run_studies` (returns within ~45 s; long studies come back `pending` with `progress`: state, stage, MD steps done of total, s/step, `eta_min_max`; with SLURM the job id), `study_status`, `get_inputs`, `jobs`, `cancel`, `run_benchmarks`, `get_file` (base64, for callers on another machine). In `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Tools: `study_format`, `validate_studies`, `run_studies` (returns within ~45 s; long studies come back `pending` with `progress`: state, stage, MD steps done of total, s/step, `eta_min_max`; with SLURM the job id), `study_status`, `get_inputs`, `jobs`, `cancel`, `run_benchmarks`, `bench_status`, `get_file` (base64, for callers on another machine). In `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 "lmpt": {"command": "/usr/bin/ssh",
@@ -172,14 +177,15 @@ lammps_translator/
   potential.py  files, force fields, commands    analysis.py  Cij, EOS, averages, RDF, MSD
   refcalc.py    reference implementation         runner.py    one study end to end
   bench.py      benchmarks                       executor.py  local pool or SLURM jobs, states
-  api.py, cli.py, mcp_server.py
-tests/test_lmpt.py  tests/test_slurm.py  tests/fakeslurm.py  tests/conftest.py    examples/studies.json    context_new_version.md
+  stale.py      stale servers after a deploy     api.py, cli.py, mcp_server.py
+tests/test_lmpt.py  tests/test_slurm.py  tests/test_server.py  tests/fakeslurm.py  tests/conftest.py    examples/studies.json    context_new_version.md
 ```
 
 ## Versions
 
 | version | changes |
 |---|---|
+| 2026.10.25.1 | Clusters of several nodes: `LMPT_SLURM_NODE` (`local` default: `--nodelist=<this node>` on a multi-node cluster, found by host name or address; `any`; a list), a `--nodelist`/`-w` in `LMPT_SLURM_ARGS` wins, ranks capped at this node's cores, `executor.node` in status. `LMPT_SLURM_ARGS` parsed as tokens (`shlex`). Stale servers (`stale.py`): `STALE_SERVER` refusal when idle, exit when idle, `server_stale` note when busy, `LMPT_EXIT_WHEN_STALE`. A failed `scontrol`, `lmp -h` or MPI probe is asked again. Tools run in worker threads and return within `wait_s`: `run_benchmarks` no longer runs the benchmarks in the call (pool or SLURM; new `bench_status` tool), `run_studies` bounds its submissions, shorter SLURM timeouts; errors reach the caller as ToolError text. 75 tests (fake two-node `scontrol`). |
 | 2026.10.22.1 | `validate_studies` returns, for each valid study, `estimate`: {`minutes` (upper estimate with these ranks), `procs` (after the atoms cap), `mem_mb` (what the job reserves: `run.mem`, a `--mem`/`--mem-per-cpu` in `LMPT_SLURM_ARGS`, `LMPT_SLURM_MEM`, or auto)}, from the same functions that write `job.sh` (llm-translators docs/EXECUTION.md "Estimates in validation", for the router). 63 tests. |
 | 2026.10.20.2 | Tests ignore the machine's settings (`tests/conftest.py` clears `LMPT_*` and `SLURM_*` for every test): on carbonio, `LMPT_PROCS=2` from `config/env` failed `test_rotated_cell_elastic_constants`, and with `LMPT_EXECUTOR=slurm` some tests submitted real jobs. |
 | 2026.10.20.1 | Per-study run settings (docs/EXECUTION.md, as cfdt 2026.10.20.1): `run` {`timeout_s`, `mem`, `procs`, `queue`} with ceilings `LMPT_MAX_TIMEOUT`, `LMPT_MAX_MEM`, `LMPT_MAX_PROCS`; validation of caps, unknown keys, sizes and conflicts; `run.mem` replaces `--mem…` in `LMPT_SLURM_ARGS`; `job.json` keeps `run`; `execution.limits`; `executor.timeout_s` and `caps` in status. Ranks capped at atoms / `LMPT_ATOMS_PER_RANK` (2000) before submitting and locally. 62 tests. |

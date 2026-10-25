@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.22.1
+Version: 2026.10.25.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks (builds the structures, finds potential files; no LAMMPS run)
@@ -8,7 +8,8 @@ Version: 2026.10.22.1
     start(studies)                   the same in the background: returns the request folder
     status(request, wait)            finished studies with results, the others pending
     inputs(study, name)              the LAMMPS inputs of one study, without running
-    bench(names)                     the benchmark studies with known answers
+    bench(names, wait)               the benchmark studies with known answers (submitted; returns within wait)
+    bench_status(bench, wait)        evaluates the finished benchmarks of a bench request
     read_file(path)                  a written file as base64 (only under the output folder)
     tool_status()                    versions, LAMMPS and its packages, potentials folders, executor
     jobs(limit, active)              recent requests with SLURM jobs and their states; the queue; the machine
@@ -205,9 +206,11 @@ def _collect(folder: Path) -> dict:
     return res
 
 
-def start(studies: dict, prefix: str = "run", extra: dict | None = None) -> Path:
+def start(studies: dict, prefix: str = "run", extra: dict | None = None, budget_s: float = 30.0) -> Path:
     """Validates, then submits each valid study: a SLURM job (LMPT_EXECUTOR=slurm and long enough, or
-    "queue": true) or the local worker pool."""
+    "queue": true) or the local worker pool. Submissions that would run past budget_s go on in a background
+    thread (their studies show as queued, 'submitting'), so a tool call returns in time."""
+    t0 = time.time()
     folder = _request_dir(prefix)
     (folder / "studies.json").write_text(json.dumps(studies, indent=1))
     invalid, jobs, where, est, natoms = {}, [], {}, {}, {}
@@ -228,11 +231,19 @@ def start(studies: dict, prefix: str = "run", extra: dict | None = None) -> Path
     X._atomic_json(folder / "request.json", {
         "names": names, "invalid": invalid, "started": time.time(), "executor": where, "estimate_min": est,
         "studies": {n: studies[n] for n in names}, "translator": __version__, **(extra or {})})
-    for n in names:
-        if where[n] == "slurm":
-            X.submit(folder, n, studies[n], est[n], natoms[n])
     if jobs:
         _POOL.submit(folder, jobs)
+    todo = [n for n in names if where[n] == "slurm"]
+    while todo and time.time() - t0 < budget_s:
+        n = todo.pop(0)
+        X.submit(folder, n, studies[n], est[n], natoms[n])
+    if todo:
+        import threading
+
+        def rest():
+            for n in todo:
+                X.submit(folder, n, studies[n], est[n], natoms[n])
+        threading.Thread(target=rest, name="lmpt-submit", daemon=False).start()
     return folder
 
 
@@ -252,8 +263,11 @@ def run(studies: dict, wait: float | None = None) -> dict:
     """Runs the studies into a new request folder under LMPT_OUT: per study <name>/ (initial.data, one folder per
     stage with in.lammps and log.lammps, run_all.sh, <name>.json; with SLURM job.sh, job.json, job.log),
     <name>.tgz; studies.json, request.json, results.json."""
-    folder = start(studies)
-    return status(str(folder), 1e9 if wait is None else wait)
+    t0 = time.time()
+    folder = start(studies, budget_s=30.0 if wait is None else max(1.0, 0.6 * float(wait)))
+    if wait is None:
+        return status(str(folder), 1e9)
+    return status(str(folder), max(0.0, float(wait) - (time.time() - t0)))
 
 
 def run_one(request: str, name: str) -> int:
@@ -370,35 +384,52 @@ def inputs(study: dict, name: str = "study") -> dict:
 
 
 def bench(names=None, request: str | None = None, wait: float | None = None, queue: bool | None = None) -> dict:
-    """Benchmarks. Locally they run here, one after another. With LMPT_EXECUTOR=slurm they are submitted like
-    studies (long ones as SLURM jobs; queue=True: all of them), and evaluated when done; with wait, pending ones are
-    reported with the request to pass back as bench(request=...)."""
+    """Benchmarks, submitted like studies: to the worker pool, or with LMPT_EXECUTOR=slurm as SLURM jobs (long ones;
+    queue=True: all). Waits at most wait seconds (None: until done, for the command line), then reports the
+    finished cases; the others are pending: evaluate them later with bench_status(request)."""
     from . import bench as B
 
-    if request is None and X.kind() != "slurm":
-        folder = _request_dir("bench")
-        r = B.run(names, folder)
-        return _bench_out(folder, r)
-    if request is None:
-        studies, pre = B.prepare(names)
-        if queue is not None:
-            studies = {n: {**st, "queue": bool(queue)} for n, st in studies.items()}
-        folder = start(studies, prefix="bench", extra={"bench": list(studies), "bench_pre": pre})
-    else:
-        folder = Path(request).expanduser()
+    if request is not None:
+        return bench_status(request, wait)
+    t0 = time.time()
+    studies, pre = B.prepare(names)
+    if queue is not None:
+        studies = {n: {**st, "queue": bool(queue)} for n, st in studies.items()}
+    folder = start(studies, prefix="bench", extra={"bench": list(studies), "bench_pre": pre},
+                   budget_s=30.0 if wait is None else max(1.0, 0.6 * float(wait)))
+    return bench_status(str(folder), None if wait is None else max(0.0, float(wait) - (time.time() - t0)))
+
+
+def bench_status(bench: str, wait: float | None = None) -> dict:
+    """The benchmarks of a bench request: rows for the finished cases (evaluated here, the fea-translator chain in a
+    background thread), the others pending. Waits up to wait seconds (None: until all are done)."""
+    from . import bench as B
+
+    folder = Path(bench).expanduser()
+    if not (folder / "request.json").is_file():
+        return {"error": f"no benchmark request {folder}"}
     meta = json.loads((folder / "request.json").read_text())
-    res = status(str(folder), 1e9 if wait is None else wait)
-    r = dict(meta.get("bench_pre", {}))
-    for n in meta.get("bench", []):
-        if n in res["studies"]:
-            r[n] = B.evaluate(n, res["studies"][n], folder)
-        else:
-            r[n] = {"pending": True, **{k: v for k, v in res.get("progress", {}).get(n, {}).items()
-                                       if k in ("state", "job_id", "reason", "eta_min_max", "stage")}}
+    t_end = time.time() + (1e9 if wait is None else max(0.0, float(wait)))
+    while True:
+        res = _collect(folder)
+        r = dict(meta.get("bench_pre", {}))
+        pending = []
+        for n in meta.get("bench", []):
+            if n in res["studies"]:
+                r[n] = B.evaluate(n, res["studies"][n], folder)
+                if r[n].get("pending"):
+                    pending.append(n)
+            else:
+                pending.append(n)
+                r[n] = {"pending": True, **{k: v for k, v in res.get("progress", {}).get(n, {}).items()
+                                           if k in ("state", "job_id", "reason", "eta_min_max", "stage")}}
+        if not pending or time.time() >= t_end:
+            break
+        time.sleep(2.0)
     out = _bench_out(folder, r)
-    if res.get("pending"):
-        out["pending"] = res["pending"]
-        out["next"] = f"call run_benchmarks(request='{folder}') later to evaluate the rest. " + res.get("next", "")
+    if pending:
+        out["pending"] = pending
+        out["next"] = (f"call bench_status(bench='{folder}') later to evaluate the rest. " + res.get("next", "")).strip()
     return out
 
 

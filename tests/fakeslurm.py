@@ -1,4 +1,4 @@
-"""fakeslurm.py — stand-ins for sbatch, squeue, scancel, sacct and sinfo (tests only). Version: 2026.10.22.1
+"""fakeslurm.py — stand-ins for sbatch, squeue, scancel, sacct and sinfo (tests only). Version: 2026.10.25.1
 
 State in $FAKE_SLURM/state.json. sbatch starts job.sh in the background (or holds it PENDING when the file
 $FAKE_SLURM/hold exists, and fails when $FAKE_SLURM/fail_submit exists); squeue reports RUNNING while the process
@@ -127,6 +127,26 @@ def sacct(args):
     return 0
 
 
+def scontrol(args):
+    """'scontrol -o show node': $FAKE_SLURM/nodes.json ([{name, hostname, addr, cpus, tpc}]) or one node, this host,
+    64 cores x 2 threads. $FAKE_SLURM/scontrol_fail makes it fail (a controller that is down)."""
+    if (D / "scontrol_fail").exists():
+        print("slurm_load_node error: Unable to contact slurm controller (connect failure)", file=sys.stderr)
+        return 1
+    calls = D / "scontrol_calls"
+    calls.write_text(str(int(calls.read_text()) + 1 if calls.exists() else 1))
+    import socket
+    f = D / "nodes.json"
+    nodes = json.loads(f.read_text()) if f.exists() else [
+        {"name": socket.gethostname(), "hostname": socket.gethostname(), "addr": "10.0.0.1", "cpus": 128, "tpc": 2}]
+    for n in nodes:
+        cores = n["cpus"] // n["tpc"]
+        print(f"NodeName={n['name']} Arch=x86_64 CoresPerSocket={cores} CPUAlloc=0 CPUTot={n['cpus']} "
+              f"NodeAddr={n['addr']} NodeHostName={n['hostname']} RealMemory=64000 Sockets=1 Boards=1 "
+              f"State=IDLE ThreadsPerCore={n['tpc']}")
+    return 0
+
+
 def sinfo(args):
     s = load()
     used = sum(j["cpus"] for j in s["jobs"].values() if current(j) == "RUNNING")
@@ -136,4 +156,5 @@ def sinfo(args):
 
 if __name__ == "__main__":
     cmd, rest = sys.argv[1], sys.argv[2:]
-    sys.exit({"sbatch": sbatch, "squeue": squeue, "scancel": scancel, "sacct": sacct, "sinfo": sinfo}[cmd](rest))
+    sys.exit({"sbatch": sbatch, "squeue": squeue, "scancel": scancel, "sacct": sacct, "sinfo": sinfo,
+                     "scontrol": scontrol}[cmd](rest))

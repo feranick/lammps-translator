@@ -1,5 +1,5 @@
 """cli.py — command line: lmpt format | validate | run | inputs | bench | status | jobs | cancel | run-study
-Version: 2026.10.22.1
+Version: 2026.10.25.1
 """
 from __future__ import annotations
 

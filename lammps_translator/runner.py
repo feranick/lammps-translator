@@ -1,5 +1,5 @@
 """runner.py — one study end to end: build, write inputs stage by stage, run LAMMPS, read, analyse, check.
-Version: 2026.10.22.1
+Version: 2026.10.25.1
 
 Folder layout (<request>/<study>/):
     initial.data, potentials/, 00_setup/ (in.lammps, log.lammps, forces0.dump), 01_<stage>/ ..., run_all.sh,
@@ -170,12 +170,16 @@ class Study:
         res["structure"] = structure_info(self.s0)
         res["units"] = self.units
         info = lmp_info()
-        from .executor import atoms_per_rank
+        from .executor import atoms_per_rank, node_cores
         cap = max(1, -(-self.s0.n // atoms_per_rank()))
         if self.procs > cap:
             self.warnings.append(f"{self.procs} ranks asked for {self.s0.n} atoms: ran on {cap} "
                                  f"(LMPT_ATOMS_PER_RANK = {atoms_per_rank()})")
             self.procs = cap
+        cores = None if os.environ.get("SLURM_NTASKS") else node_cores()
+        if cores and self.procs > cores:
+            self.warnings.append(f"{self.procs} ranks asked for, this node has {cores} cores: ran on {cores}")
+            self.procs = cores
         res["execution"]["procs_used"] = self.procs
         res["lammps"] = {"version": info.get("version"), "exe": info.get("exe"), "procs": self.procs}
         if self.procs > 1:

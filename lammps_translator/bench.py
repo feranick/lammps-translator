@@ -1,12 +1,14 @@
 """bench.py — benchmark studies with known answers (closed forms, lattice sums, published values).
-Version: 2026.10.22.1
+Version: 2026.10.25.1
 
 Default cases take seconds; 'slow' ones run only by name. 'chain_feat_cantilever' needs fea-translator
 (and CalculiX) in the same environment and is skipped otherwise.
 """
 from __future__ import annotations
 
+import json
 import math
+import threading
 import time
 from pathlib import Path
 
@@ -215,8 +217,35 @@ def prepare(names=None) -> tuple[dict, dict]:
     return studies, pre
 
 
-def evaluate(n: str, res: dict, folder: Path | None = None) -> dict:
-    """A benchmark's row from its study result."""
+_CHAIN_RUNNING: set = set()
+
+
+def _chain_async(res: dict, folder: Path, case_dir: Path) -> dict | None:
+    """The fea-translator chain runs FEA: in a background thread, its result cached in feat_chain.json, so a tool
+    call that evaluates it returns at once. None while it runs."""
+    f = case_dir / "feat_chain.json"
+    if f.is_file():
+        return json.loads(f.read_text())
+    key = str(f)
+    if key not in _CHAIN_RUNNING:
+        _CHAIN_RUNNING.add(key)
+
+        def work():
+            try:
+                out = _chain_feat(res, folder)
+            except Exception as exc:  # noqa: BLE001
+                out = {"why": f"fea-translator chain failed: {exc}"}
+            case_dir.mkdir(parents=True, exist_ok=True)
+            tmp = f.with_suffix(".tmp")
+            tmp.write_text(json.dumps(out, default=float))
+            tmp.replace(f)
+            _CHAIN_RUNNING.discard(key)
+        threading.Thread(target=work, name="lmpt-feat-chain", daemon=True).start()
+    return None
+
+
+def evaluate(n: str, res: dict, folder: Path | None = None, sync: bool = False) -> dict:
+    """A benchmark's row from its study result. The fea-translator chain runs in the background unless sync."""
     c = cases()[n]
     secs = (res.get("seconds") or {}).get("wall") if isinstance(res.get("seconds"), dict) else None
     row = {"what": c["what"], "ok": res.get("ok"), "reliable": res.get("reliable"), "seconds": secs}
@@ -230,7 +259,12 @@ def evaluate(n: str, res: dict, folder: Path | None = None) -> dict:
         return row
     checks = []
     if n == "chain_feat_cantilever":
-        ch = _chain_feat(res, folder or Path("."))
+        if sync:
+            ch = _chain_feat(res, folder or Path("."))
+        else:
+            ch = _chain_async(res, folder or Path("."), (folder or Path(".")) / n)
+            if ch is None:
+                return {**row, "pending": True, "state": "evaluating", "stage": "fea-translator cantilever"}
         if "skipped" in ch:
             return {"skipped": ch["skipped"], "what": c["what"]}
         checks = ch.get("checks", [])
@@ -272,7 +306,7 @@ def run(names=None, folder: Path | None = None) -> dict:
     for n, st in studies.items():
         t0 = time.time()
         res = run_study(n, st, (folder or Path(".")) / n, 3600)
-        row = evaluate(n, res, folder)
+        row = evaluate(n, res, folder, sync=True)
         row["seconds"] = round(time.time() - t0, 2)
         out[n] = row
     order = names or [k for k in cases() if k in out]

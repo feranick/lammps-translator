@@ -1,5 +1,5 @@
 """lammps.py — the only module that runs LAMMPS: finds the executable, reads its capabilities, runs inputs.
-Version: 2026.10.22.1
+Version: 2026.10.25.1
 
 Executable: LMPT_LMP (a command, e.g. 'lmp', '/opt/lammps/bin/lmp_mpi' or 'mpirun -np 4 lmp'), else the first of
 lmp, lmp_mpi, lmp_serial, lmp_stable, lmp_openmpi, lammps on the PATH, else the same names in /usr/bin,
@@ -13,7 +13,6 @@ import shlex
 import shutil
 import subprocess
 import time
-from functools import lru_cache
 from pathlib import Path
 
 NAMES = ("lmp", "lmp_mpi", "lmp_serial", "lmp_stable", "lmp_openmpi", "lammps")
@@ -53,10 +52,15 @@ def not_found() -> str:
             "env LMPT_LMP=... lmpt-mcp)")
 
 
-@lru_cache(maxsize=4)
+_INFO: dict = {}
+
+
 def _info(cmd: tuple) -> dict:
+    """'lmp -h': version, packages, styles. Kept only when it worked: a failure is asked again next time."""
+    if cmd in _INFO:
+        return _INFO[cmd]
     try:
-        r = subprocess.run([*cmd, "-h"], capture_output=True, text=True, timeout=60)
+        r = subprocess.run([*cmd, "-h"], capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"error": f"{cmd[0]} -h failed: {exc}"}
     text = r.stdout + r.stderr
@@ -71,6 +75,10 @@ def _info(cmd: tuple) -> dict:
         styles[sec.lower()] = m.group(1).split() if m else []
     out["styles"] = styles
     out["mpi"] = "MPI v" in text or "MPICH" in text or "Open MPI" in text
+    if out["version"] is None:
+        out["error"] = f"{cmd[0]} -h did not print a LAMMPS version (exit {r.returncode}): {text.strip()[-300:]}"
+        return out
+    _INFO[cmd] = out
     return out
 
 
@@ -114,8 +122,20 @@ def cpu_topology() -> dict:
     return {"hwthreads": len(cpus), "cores": len(cores)}
 
 
-@lru_cache(maxsize=4)
+_FLAVOR: dict = {}
+
+
 def mpi_flavor(launcher: str) -> str:
+    """openmpi | mpich | unknown; 'unknown' (mpirun missing or silent) is asked again next time."""
+    if launcher in _FLAVOR:
+        return _FLAVOR[launcher]
+    f = _flavor(launcher)
+    if f != "unknown":
+        _FLAVOR[launcher] = f
+    return f
+
+
+def _flavor(launcher: str) -> str:
     r = _info_text([launcher, "--version"])
     t = r.lower()
     if "open mpi" in t or "open-mpi" in t or "prrte" in t or "prterun" in t:
@@ -127,7 +147,7 @@ def mpi_flavor(launcher: str) -> str:
 
 def _info_text(cmd: list[str]) -> str:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return r.stdout + r.stderr
     except (OSError, subprocess.TimeoutExpired):
         return ""

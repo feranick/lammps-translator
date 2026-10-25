@@ -1,4 +1,4 @@
-"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.22.1
+"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.10.25.1
 They run anywhere; with LAMMPS (set LMPT_LMP, or lmp on the PATH) the jobs also compute real results."""
 import json
 import os
@@ -27,7 +27,7 @@ def slurm(tmp_path, monkeypatch):
     fake.mkdir()
     bin_ = tmp_path / "bin"
     bin_.mkdir()
-    for c in ("sbatch", "squeue", "scancel", "sacct", "sinfo"):
+    for c in ("sbatch", "squeue", "scancel", "sacct", "sinfo", "scontrol"):
         w = bin_ / c
         w.write_text(f"#!/bin/sh\nexec {sys.executable} {HERE / 'fakeslurm.py'} {c} \"$@\"\n")
         w.chmod(0o755)
@@ -44,7 +44,9 @@ def slurm(tmp_path, monkeypatch):
     monkeypatch.setenv("LMPT_ATOMS_PER_RANK", "1")      # no size cap unless a test sets one
     for k in ("LMPT_MAX_TIMEOUT", "LMPT_MAX_MEM", "LMPT_MAX_PROCS", "LMPT_SLURM_ARGS", "LMPT_SLURM_MEM", "LMPT_PROCS"):
         monkeypatch.delenv(k, raising=False)
-    return fake
+    X.forget_nodes()
+    yield fake
+    X.forget_nodes()
 
 
 def _state(fake):
@@ -383,3 +385,104 @@ def test_validation_estimates_match_the_job(slurm, monkeypatch):
     monkeypatch.setenv("LMPT_SLURM_ARGS", "--mem-per-cpu=1G")
     assert validate({"md": md})["studies"]["md"]["estimate"]["mem_mb"] == 3 * 1024
     assert "estimate" not in validate({"bad": {**LJ, "run": {"walltime": 1}}})["studies"]["bad"]
+
+
+# ------------------------------------------------------------------- clusters of several nodes (EXECUTION.md)
+SPARKS = [{"name": "spark-5da5", "hostname": "spark-5da5", "addr": "100.77.175.91", "cpus": 20, "tpc": 1},
+          {"name": "spark-0808", "hostname": "spark-0808", "addr": "100.76.107.42", "cpus": 8, "tpc": 2}]
+
+
+def _two_nodes(slurm, monkeypatch, me_addr="100.76.107.42"):
+    (slurm / "nodes.json").write_text(json.dumps(SPARKS))
+    monkeypatch.setattr(X, "_my_addresses", lambda: {"127.0.0.1", me_addr})   # host name matches neither
+    X.forget_nodes()
+
+
+def test_node_local_pins_jobs_to_this_node(slurm, monkeypatch):
+    (slurm / "hold").write_text("")
+    _two_nodes(slurm, monkeypatch)
+    n = X.status()["node"]
+    assert n == {"setting": "local", "nodelist": "spark-0808", "cluster_nodes": 2, "this_node": "spark-0808",
+                 "cores": 4}
+    r = api.run({"lj": {**LJ, "run": {"procs": 10}}}, wait=0)
+    d = Path(r["request"]) / "lj"
+    job = (d / "job.sh").read_text()
+    assert "#SBATCH --nodelist=spark-0808" in job
+    assert "#SBATCH --ntasks=4" in job                       # this node's 4 cores (8 CPUs, 2 per core), not 20
+    assert json.loads((d / "job.json").read_text())["nodelist"] == "spark-0808"
+    from lammps_translator.format import validate
+    assert validate({"lj": {**LJ, "run": {"procs": 10}}})["studies"]["lj"]["estimate"]["procs"] == 4
+
+
+def test_node_any_list_and_args(slurm, monkeypatch):
+    (slurm / "hold").write_text("")
+    _two_nodes(slurm, monkeypatch)
+    monkeypatch.setenv("LMPT_SLURM_NODE", "any")
+    assert X.status()["node"]["nodelist"] is None
+    r = api.run({"lj": LJ}, wait=0)
+    assert "--nodelist" not in (Path(r["request"]) / "lj" / "job.sh").read_text()
+    monkeypatch.setenv("LMPT_SLURM_NODE", "spark-5da5,spark-0808")
+    assert X.status()["node"]["nodelist"] == "spark-5da5,spark-0808"
+    r = api.run({"lj": LJ}, wait=0)
+    assert "#SBATCH --nodelist=spark-5da5,spark-0808" in (Path(r["request"]) / "lj" / "job.sh").read_text()
+    monkeypatch.setenv("LMPT_SLURM_NODE", "local")
+    monkeypatch.setenv("LMPT_SLURM_ARGS", "-w spark-5da5 --nice=10")       # a -w in the args wins
+    n = X.status()["node"]
+    assert n["nodelist"] == "spark-5da5"
+    r = api.run({"lj": LJ}, wait=0)
+    d = Path(r["request"]) / "lj"
+    assert "--nodelist" not in (d / "job.sh").read_text()
+    assert json.loads((d / "job.json").read_text())["command"][2:5] == ["-w", "spark-5da5", "--nice=10"]
+
+
+def test_single_node_cluster_and_unknown_node(slurm, monkeypatch):
+    (slurm / "hold").write_text("")
+    assert X.status()["node"]["nodelist"] is None and X.status()["node"]["cluster_nodes"] == 1   # default fake
+    r = api.run({"lj": LJ}, wait=0)
+    assert "--nodelist" not in (Path(r["request"]) / "lj" / "job.sh").read_text()
+    _two_nodes(slurm, monkeypatch, me_addr="192.168.9.9")                    # this machine is neither
+    n = X.status()["node"]
+    assert n["nodelist"] is None and n["this_node"] is None and "LMPT_SLURM_NODE" in n["warning"]
+
+
+def test_two_options_in_slurm_args(slurm, monkeypatch):
+    (slurm / "hold").write_text("")
+    _two_nodes(slurm, monkeypatch)
+    monkeypatch.setenv("LMPT_SLURM_ARGS", "--mem=8G --nodelist=spark-5da5")
+    monkeypatch.setenv("LMPT_SLURM_MEM", "4G")                                # the args' --mem wins
+    s = X.status()
+    assert s["node"]["nodelist"] == "spark-5da5" and s["mem"] == "--mem=8G (from LMPT_SLURM_ARGS)"
+    r = api.run({"lj": LJ}, wait=0)
+    d = Path(r["request"]) / "lj"
+    job, info = (d / "job.sh").read_text(), json.loads((d / "job.json").read_text())
+    assert "--mem" not in job and "--nodelist" not in job
+    assert info["command"][2:4] == ["--mem=8G", "--nodelist=spark-5da5"] and info["nodelist"] == "spark-5da5"
+    from lammps_translator.format import validate
+    assert validate({"lj": LJ})["studies"]["lj"]["estimate"]["mem_mb"] == 8192
+    monkeypatch.setenv("LMPT_SLURM_ARGS", "--nice=5 '--comment=two words' --mem=6000M")    # quoted: shlex, not split
+    assert X.slurm_args_tokens() == ["--nice=5", "--comment=two words", "--mem=6000M"]
+    assert X.job_mem(1, 100) is None
+
+
+def test_failed_scontrol_is_asked_again(slurm, monkeypatch):
+    (slurm / "scontrol_fail").write_text("")
+    assert X.cluster_nodes() is None and X.status()["node"]["cluster_nodes"] is None
+    (slurm / "scontrol_fail").unlink()
+    X._NODES_CACHE["failed"] -= 10                                             # the next call, seconds later
+    assert X.cluster_nodes() is not None                                       # the controller is back
+    calls = int((slurm / "scontrol_calls").read_text())
+    X.cluster_nodes()
+    assert int((slurm / "scontrol_calls").read_text()) == calls                # a success is kept (60 s)
+
+
+def test_failed_lmp_info_is_asked_again(tmp_path, monkeypatch):
+    from lammps_translator import lammps as L
+    flag = tmp_path / "ok"
+    exe = tmp_path / "lmp"
+    exe.write_text("#!/bin/sh\n[ -f %s ] && echo 'Large-scale Atomic/Molecular Massively Parallel Simulator - "
+                   "4 Jul 2026' && exit 0\necho 'error while loading shared libraries' >&2; exit 127\n" % flag)
+    exe.chmod(0o755)
+    monkeypatch.setenv("LMPT_LMP", str(exe))
+    assert "error" in L.lmp_info()
+    flag.write_text("")
+    assert L.lmp_info().get("version") == "4 Jul 2026"

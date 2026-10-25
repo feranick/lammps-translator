@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run atomistic studies with LAMMPS.
-Version: 2026.10.22.1
+Version: 2026.10.25.1
 
 Tools (all JSON):
   study_format      the study format: systems, potentials, force fields, stages. Read it first.
@@ -7,10 +7,15 @@ Tools (all JSON):
   run_studies       runs and checks {name: study} (returns within ~45 s; long studies stay pending)
   study_status      collects the pending studies of a run_studies request
   get_inputs        the LAMMPS inputs and data file of one study, without running
-  run_benchmarks    the benchmark studies with known answers (is the toolchain right?)
+  run_benchmarks    the benchmark studies with known answers (submits; returns within wait_s)
+  bench_status      evaluates the benchmarks of a run_benchmarks request that have finished
   jobs              recent and active SLURM runs (also from other conversations), the queue, the machine
   cancel            stops a request's studies
   get_file          a written file as base64 (for callers on another machine)
+
+Every tool returns within its wait_s (at most 50 s): LAMMPS runs in worker processes or SLURM jobs, never in the
+call's thread (each tool runs in a worker thread, off the event loop). A server whose code is no longer the
+installed one refuses calls with STALE_SERVER while idle, and exits (stale.py, llm-translators docs/SHARED.md).
 
 Run:  lmpt-mcp                       (stdio)
       lmpt-mcp --http 8769 [--host 0.0.0.0]
@@ -18,14 +23,19 @@ Run:  lmpt-mcp                       (stdio)
 from __future__ import annotations
 
 import argparse
+import functools
 
-from . import api, executor
+import anyio.to_thread
+
+from . import api, executor, stale
 
 try:  # MCP Python SDK 2.x
     from mcp.server.mcpserver import MCPServer as _Server
+    from mcp.server.mcpserver.exceptions import ToolError
     _V2 = True
 except ImportError:  # 1.x
     from mcp.server.fastmcp import FastMCP as _Server
+    from mcp.server.fastmcp.exceptions import ToolError
     _V2 = False
 
 INSTRUCTIONS = """lammps-translator runs atomistic simulations with LAMMPS: crystals (fcc, bcc, hcp, diamond, rocksalt,
@@ -45,14 +55,40 @@ Long studies run as SLURM jobs on the machine (when LMPT_EXECUTOR=slurm): run_st
 job ids. They do not depend on this conversation. Report the expected finish time and stop; do not poll. Later,
 study_status(request) collects them; jobs() lists recent and active runs (also those started in other
 conversations); cancel(request) stops them. A study's "run": {timeout_s, mem, procs, queue} sets its own time,
-memory, ranks and queueing, within the caps in study_format's status.executor.caps.
+memory, ranks and queueing, within the caps in study_format's status.executor.caps. run_benchmarks submits and
+returns; bench_status(bench) evaluates the finished cases.
 Units: potentials eV, A (metal); force fields kcal/mol, A (real); T in K, P_bar in bar, dt_fs in fs; results in
 eV, A, GPa, K, ps, g/cm3, J/m2."""
 
 server = _Server("lammps-translator", instructions=INSTRUCTIONS)
 
 
+def _tool(fn):
+    """Every tool: counted in and out (stale servers, stale.py), run in a worker thread (run_studies and
+    study_status wait up to 50 s; on the event loop they would block other requests and pings), and any exception
+    re-raised as a ToolError with its message (MCP SDK 2.x passes on only a ToolError's text)."""
+    @functools.wraps(fn)
+    async def wrap(*args, **kwargs):
+        refused = stale.enter_call()
+        if refused:
+            raise ToolError(refused)
+        try:
+            r = await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+        except ToolError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - its text must reach the caller
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        finally:
+            stale.leave_call()
+        n = stale.note()
+        if n and isinstance(r, dict):
+            r = {**r, "server_stale": n}
+        return r
+    return wrap
+
+
 @server.tool()
+@_tool
 def study_format() -> dict:
     """The study format: systems (lattices, molecules, data files), potentials and force fields, stage kinds
     with their parameters, conventions, an example; and the LAMMPS version, packages and potential folders."""
@@ -60,6 +96,7 @@ def study_format() -> dict:
 
 
 @server.tool()
+@_tool
 def validate_studies(studies: dict) -> dict:
     """Static checks of studies given as {name: study}: builds each structure and finds its potential files.
     Returns per study ok, errors (each says what to fix), warnings, and for a valid study its estimate
@@ -68,6 +105,7 @@ def validate_studies(studies: dict) -> dict:
 
 
 @server.tool()
+@_tool
 def run_studies(studies: dict, wait_s: float = 45) -> dict:
     """Builds, runs (LAMMPS) and checks each study. Per study: one result block per stage (energies, lattice
     constants, Cij, moduli, EOS fit, vacancy/surface energies, MD means and errors, RDF, diffusion), 'structure',
@@ -79,6 +117,7 @@ def run_studies(studies: dict, wait_s: float = 45) -> dict:
 
 
 @server.tool()
+@_tool
 def study_status(request: str, wait_s: float = 45) -> dict:
     """The studies of a run_studies request (its 'request' path): finished ones with their results, the others
     in 'pending' with progress and state (queued: reason, expected_start, ahead; running: stage, eta_min_max,
@@ -88,6 +127,7 @@ def study_status(request: str, wait_s: float = 45) -> dict:
 
 
 @server.tool()
+@_tool
 def get_inputs(study: dict, name: str = "study") -> dict:
     """Builds one study and writes its LAMMPS inputs without running: the structure summary, every stage's
     in.lammps as text and the head of the data file."""
@@ -95,6 +135,7 @@ def get_inputs(study: dict, name: str = "study") -> dict:
 
 
 @server.tool()
+@_tool
 def jobs(limit: int = 20, active: bool = False) -> dict:
     """The newest requests that have SLURM jobs (from any conversation), each study's state, job id and ETA;
     queue {running, queued, cpus_in_use} for this translator's jobs; machine {cpus, cpus_allocated}.
@@ -103,6 +144,7 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
 
 
 @server.tool()
+@_tool
 def cancel(request: str, names: list[str] | None = None) -> dict:
     """Stops a request's studies (all, or the named ones): scancel for SLURM jobs; a local study only if this
     server process runs it. Returns what was cancelled and the request's states."""
@@ -110,15 +152,28 @@ def cancel(request: str, names: list[str] | None = None) -> dict:
 
 
 @server.tool()
-def run_benchmarks(names: list[str] | None = None, request: str | None = None) -> dict:
-    """Runs the benchmark studies with known answers (LJ lattice sums, Madelung constants, Cauchy relation,
+@_tool
+def run_benchmarks(names: list[str] | None = None, request: str | None = None, wait_s: float = 30) -> dict:
+    """Submits the benchmark studies with known answers (LJ lattice sums, Madelung constants, Cauchy relation,
     Cu EAM and Si Tersoff published values, equipartition, NVE conservation; slow: spce_water; chain with
-    fea-translator: chain_feat_cantilever) and reports pass or fail. With SLURM, long cases become jobs: pending
-    ones come back with 'request'; call run_benchmarks(request=...) later to evaluate them."""
-    return api.bench(names, request, wait=45.0 if executor.kind() == "slurm" or request else None)
+    fea-translator: chain_feat_cantilever) to the worker pool or SLURM, waits at most wait_s (50) and reports
+    pass or fail for those done; the rest are 'pending': evaluate them later with bench_status(bench=request)."""
+    w = min(max(float(wait_s), 0.0), 50.0)
+    if request:
+        return api.bench_status(request, w)
+    return api.bench(names, wait=w)
 
 
 @server.tool()
+@_tool
+def bench_status(bench: str, wait_s: float = 30) -> dict:
+    """The benchmarks of a run_benchmarks request (its 'request' path): pass or fail for the finished cases,
+    the others in 'pending'. Waits up to wait_s seconds (at most 50)."""
+    return api.bench_status(bench, min(max(float(wait_s), 0.0), 50.0))
+
+
+@server.tool()
+@_tool
 def get_file(path: str, max_mb: float = 20) -> dict:
     """A file written by run_studies (a path from its result) as base64."""
     return api.read_file(path, max_mb)
@@ -129,6 +184,7 @@ def main() -> None:
     ap.add_argument("--http", type=int, help="serve MCP over streamable HTTP on this port (default: stdio)")
     ap.add_argument("--host", default="127.0.0.1")
     a = ap.parse_args()
+    stale.serve()
     if a.http is None:
         server.run()
     elif _V2:

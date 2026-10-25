@@ -1,6 +1,6 @@
 """lammps-translator: atomistic studies (structure, potential, ordered stages) -> LAMMPS inputs and checked results.
-Version: 2026.10.22.1
+Version: 2026.10.25.1
 
 Author: Nicola Ferralis <ferralis@generalflash.com>
 """
-__version__ = "2026.10.22.1"
+__version__ = "2026.10.25.1"
