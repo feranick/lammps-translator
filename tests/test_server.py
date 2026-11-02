@@ -1,5 +1,5 @@
 """MCP server behaviour: stale servers after a deploy (llm-translators docs/SHARED.md) and tools that return
-within wait_s. Version: 2026.10.25.2"""
+within wait_s. Version: 2026.11.2.1"""
 import asyncio
 import json
 import os
