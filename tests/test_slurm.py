@@ -1,4 +1,4 @@
-"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.11.2.1
+"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.11.7.1
 They run anywhere; with LAMMPS (set LMPT_LMP, or lmp on the PATH) the jobs also compute real results."""
 import json
 import os
@@ -318,7 +318,8 @@ def test_run_settings_override_defaults_for_that_study(slurm, monkeypatch):
     assert "#SBATCH --time=370" in plain and "#SBATCH --ntasks=2" in plain and "--mem" not in plain
     assert pinfo["command"][2:-1] == ["--mem=8G", "--nice=100"] and pinfo["run"] == {}
     s = X.status()
-    assert s["timeout_s"] == 21600 and s["caps"] == {"timeout_s": None, "mem": None, "procs": None}
+    assert s["timeout_s"] == 21600 and s["caps"] == {"timeout_s": None, "mem": "64000M", "procs": None,   # the
+                                                     "mem_mb": 64000, "mem_from": "a node's memory (SLURM RealMemory)"}
 
 
 @pytest.mark.parametrize("study, word", [
@@ -340,7 +341,8 @@ def test_run_settings_validation(slurm, monkeypatch, study, word):
     v = validate_study(study)
     assert not v["ok"] and any(word in e for e in v["errors"]), v["errors"]
     assert validate_study({**LJ, "run": {"timeout_s": 43200, "mem": "32768M", "procs": 20}})["ok"]
-    assert X.status()["caps"] == {"timeout_s": 43200.0, "mem": "32G", "procs": 20}
+    assert X.status()["caps"] == {"timeout_s": 43200.0, "mem": "32G", "procs": 20, "mem_mb": 32768,
+                                  "mem_from": "LMPT_MAX_MEM"}
 
 
 def test_size_cap_on_ranks(slurm, monkeypatch):
@@ -487,3 +489,52 @@ def test_failed_lmp_info_is_asked_again(tmp_path, monkeypatch):
     assert "error" in L.lmp_info()
     flag.write_text("")
     assert L.lmp_info().get("version") == "4 Jul 2026"
+
+
+
+# ------------------------------------------------------------------- the most memory a job can have
+def test_node_memory_caps_run_mem(slurm, monkeypatch):
+    from lammps_translator.format import validate_study
+    (slurm / "nodes.json").write_text(json.dumps([{**SPARKS[0], "mem": 62926}, {**SPARKS[1], "mem": 120000}]))
+    monkeypatch.setattr(X, "_my_addresses", lambda: {"100.77.175.91"})        # this is spark-5da5
+    monkeypatch.setattr(X, "_hostname", lambda: "lmpt-test-host")
+    X.forget_nodes()
+    c = X.caps()
+    assert c["mem"] == "62926M" and c["mem_mb"] == 62926 and "RealMemory" in c["mem_from"]   # this node, not 120 GB
+    v = validate_study({**LJ, "run": {"mem": "90G"}})
+    assert not v["ok"] and any("62926M" in e and "RealMemory" in e for e in v["errors"]), v["errors"]
+    assert validate_study({**LJ, "run": {"mem": "60G"}})["ok"]
+    monkeypatch.setenv("LMPT_MAX_MEM", "16G")                                  # a lower ceiling wins
+    assert X.caps()["mem"] == "16G" and X.caps()["mem_mb"] == 16384 and X.caps()["mem_from"] == "LMPT_MAX_MEM"
+    monkeypatch.setenv("LMPT_MAX_MEM", "200G")                                 # a higher one: the node's memory
+    assert X.caps()["mem_mb"] == 62926
+    monkeypatch.delenv("LMPT_MAX_MEM")
+    monkeypatch.setenv("LMPT_SLURM_NODE", "any")                               # SLURM may choose: the larger node
+    assert X.caps()["mem_mb"] == 120000
+    monkeypatch.setenv("LMPT_SLURM_NODE", "local")
+    monkeypatch.setenv("LMPT_ATOMS_PER_RANK", "1")
+    assert X.parse_mem_mb(X.job_mem(1, 50_000_000)) == 62926                   # auto never above the node
+
+
+def test_no_node_memory_without_slurm_or_when_unknown(slurm, monkeypatch):
+    (slurm / "nodes.json").write_text(json.dumps([{"name": "n1", "hostname": "n1", "addr": "", "cpus": 8, "tpc": 1,
+                                                   "mem": 1}]))           # SLURM does not know it
+    monkeypatch.setattr(X, "_hostname", lambda: "n1")
+    X.forget_nodes()
+    assert "mem_mb" not in X.caps() and X.caps()["mem"] is None
+    monkeypatch.setenv("LMPT_EXECUTOR", "local")
+    monkeypatch.setenv("LMPT_MAX_MEM", "8G")
+    assert X.caps()["mem_mb"] == 8192 and X.caps()["mem_from"] == "LMPT_MAX_MEM"
+
+
+def test_request_name_submits_once(slurm):
+    (slurm / "hold").write_text("")
+    r = api.run({"lj": LJ}, wait=0, request_name="run_20261107_120000_abc123")
+    assert r["request"].endswith("/run_20261107_120000_abc123") and r["pending"] == ["lj"]
+    again = api.run({"lj": LJ}, wait=0, request_name="run_20261107_120000_abc123")
+    assert "submitted before" in again["note"] and again["pending"] == ["lj"]
+    assert len(_state(slurm)["jobs"]) == 1                                     # sbatch ran once
+    assert "error" in api.run({"lj": LJ}, wait=0, request_name="../etc")
+    assert "error" in api.run({"lj": LJ}, wait=0, request_name="bench_1")
+    (Path(r["request"]).parent / "run_half").mkdir()
+    assert "holds no request" in api.run({"lj": LJ}, wait=0, request_name="run_half")["error"]

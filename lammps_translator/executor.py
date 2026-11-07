@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.2.1
+Version: 2026.11.7.1
 
 Settings (environment): LMPT_EXECUTOR local | slurm (local); LMPT_SLURM_MIN_MINUTES (1): studies estimated
 shorter run locally; LMPT_SLURM_ARGS: extra sbatch arguments; LMPT_PROCS (MPI ranks, --ntasks); LMPT_TIMEOUT
@@ -81,7 +81,10 @@ def parse_mem_mb(v) -> float | None:
 
 
 def caps() -> dict:
-    """LMPT_MAX_TIMEOUT (s), LMPT_MAX_MEM (size), LMPT_MAX_PROCS: what a study's run may ask; None: no cap."""
+    """What a study's run may ask (None: no cap): LMPT_MAX_TIMEOUT (s) and LMPT_MAX_PROCS; mem is the smaller of
+    LMPT_MAX_MEM and, with SLURM, the memory of the node(s) jobs go to (RealMemory), with mem_mb in MB for
+    llm-translators' router and mem_from saying which. A job asking for more than a node has fails only at sbatch
+    ('Memory specification can not be satisfied'), so validation refuses it first."""
     def num(k):
         v = os.environ.get(k, "").strip()
         try:
@@ -89,8 +92,18 @@ def caps() -> dict:
         except ValueError:
             return None
     mem = os.environ.get("LMPT_MAX_MEM", "").strip() or None
+    out = {"timeout_s": num("LMPT_MAX_TIMEOUT"), "mem": mem, "procs": None}
     p = num("LMPT_MAX_PROCS")
-    return {"timeout_s": num("LMPT_MAX_TIMEOUT"), "mem": mem, "procs": int(p) if p else None}
+    out["procs"] = int(p) if p else None
+    mem_from = "LMPT_MAX_MEM" if mem else None
+    nm = node_mem_mb()
+    if nm and (not mem or (parse_mem_mb(mem) or 0) > nm):
+        out["mem"] = f"{int(nm)}M"
+        mem_from = "a node's memory (SLURM RealMemory)"
+    if out["mem"] and parse_mem_mb(out["mem"]):
+        out["mem_mb"] = int(parse_mem_mb(out["mem"]))
+        out["mem_from"] = mem_from
+    return out
 
 
 def check_run(study: dict) -> list[str]:
@@ -115,7 +128,9 @@ def check_run(study: dict) -> list[str]:
             if mb is None or mb <= 0:
                 E.append("run.mem: a SLURM size such as '500M', '8G' or '1T'")
             elif c["mem"] and parse_mem_mb(c["mem"]) and mb > parse_mem_mb(c["mem"]):
-                E.append(f"run.mem: {r['mem']} is above LMPT_MAX_MEM ({c['mem']})")
+                E.append(f"run.mem: {r['mem']} is above {c['mem']}, the most on this machine "
+                         f"({c.get('mem_from') or 'LMPT_MAX_MEM'}); ask for less, or a machine with more "
+                         "(machines(): executor.caps.mem)")
         if "procs" in r:
             if not (isinstance(r["procs"], int) and not isinstance(r["procs"], bool) and r["procs"] >= 1):
                 E.append("run.procs: MPI ranks, an integer >= 1")
@@ -236,6 +251,9 @@ def job_mem(procs: int, natoms: int | None, study: dict | None = None) -> str | 
         return m
     mb = 1024 + 256 * procs + 0.004 * (natoms or 100000)
     mb = max(2048, int(math.ceil(mb / 512.0)) * 512)
+    cap = caps().get("mem_mb")
+    if cap and mb > cap:
+        mb = int(cap)           # what a node has: asking for more fails at sbatch
     return f"{mb}M"
 
 
@@ -400,6 +418,7 @@ def cluster_nodes() -> list[dict] | None:
         cores = num("CoresPerSocket") * max(1, num("Sockets", 1)) * max(1, num("Boards", 1)) or (cpus // tpc)
         nodes.append({"name": kv["NodeName"], "hostname": kv.get("NodeHostName", kv["NodeName"]),
                       "addr": kv.get("NodeAddr", ""), "cpus": cpus, "threads_per_core": tpc,
+                      "mem_mb": num("RealMemory"),
                       "cores": min(cores, cpus // tpc) if cpus else cores, "state": kv.get("State", "")})
     _NODES_CACHE["v"] = (time.time(), nodes)
     return nodes
@@ -485,20 +504,35 @@ def node_plan() -> dict:
     return out
 
 
+def _job_nodes(nodes: list[dict]) -> list[dict]:
+    """The nodes this machine's jobs may run on: the nodelist they ask for, else this node (local), else all."""
+    plan = node_plan()
+    if plan["nodelist"]:
+        names = set(_expand_nodelist(plan["nodelist"]))
+        return [n for n in nodes if n["name"] in names] or nodes
+    me = this_node(nodes)
+    return [me] if (me and plan["setting"] == "local") else nodes
+
+
+def node_mem_mb() -> float | None:
+    """The most memory one job can ask for (MB): the largest RealMemory among the nodes jobs go to; None without
+    SLURM, when scontrol fails (asked again next time), or when SLURM does not know it (an unset node reports 1)."""
+    if kind() != "slurm":
+        return None
+    nodes = cluster_nodes()
+    if not nodes:
+        return None
+    vals = [n["mem_mb"] for n in _job_nodes(nodes) if n.get("mem_mb", 0) >= 1024]
+    return float(max(vals)) if vals else None
+
+
 def node_cores() -> int | None:
     """Physical cores of the node the jobs run on (this node; with a node list or 'any', the smallest of them),
     from SLURM; without SLURM, this machine's cores. None if unknown."""
     if kind() == "slurm":
         nodes = cluster_nodes()
         if nodes:
-            plan = node_plan()
-            if plan["nodelist"]:
-                names = set(_expand_nodelist(plan["nodelist"]))
-                sel = [n for n in nodes if n["name"] in names] or nodes
-            else:
-                me = this_node(nodes)
-                sel = [me] if (me and plan["setting"] == "local") else nodes
-            cores = [n["cores"] for n in sel if n.get("cores")]
+            cores = [n["cores"] for n in _job_nodes(nodes) if n.get("cores")]
             if cores:
                 return min(cores)
     try:

@@ -1,5 +1,5 @@
 """lammps.py — the only module that runs LAMMPS: finds the executable, reads its capabilities, runs inputs.
-Version: 2026.11.2.1
+Version: 2026.11.7.1
 
 Executable: LMPT_LMP (a command, e.g. 'lmp', '/opt/lammps/bin/lmp_mpi' or 'mpirun -np 4 lmp'), else the first of
 lmp, lmp_mpi, lmp_serial, lmp_stable, lmp_openmpi, lammps on the PATH, else the same names in /usr/bin,
@@ -191,12 +191,30 @@ def run(input_name: str, log_name: str, cwd: Path, procs: int = 1, timeout: floa
     env.setdefault("OMP_NUM_THREADS", "1")
     t0 = time.perf_counter()
     cancel = Path(cwd).parent / "CANCEL"      # written by api.cancel for a local study
-    cancelled = False
     try:
         p = subprocess.Popen(full, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
                              start_new_session=True)
     except OSError as exc:
         return {"rc": -1, "seconds": 0.0, "stderr": str(exc), "command": " ".join(full)}
+    _RUNNING.add(p)
+    try:
+        return _wait(p, full, t0, cancel, timeout)
+    finally:
+        _RUNNING.discard(p)
+
+
+_RUNNING: set = set()       # LAMMPS runs (own process groups) started by this process, for kill_all
+
+
+def kill_all() -> None:
+    """Ends every LAMMPS process group this process started (a worker whose server is gone: workers.py)."""
+    for p in list(_RUNNING):
+        if p.poll() is None:
+            _kill(p)
+
+
+def _wait(p, full, t0, cancel, timeout) -> dict:
+    cancelled = False
     rc = None
     while rc is None:
         try:

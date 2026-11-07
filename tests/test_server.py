@@ -1,5 +1,5 @@
 """MCP server behaviour: stale servers after a deploy (llm-translators docs/SHARED.md) and tools that return
-within wait_s. Version: 2026.11.2.1"""
+within wait_s. Version: 2026.11.7.1"""
 import asyncio
 import json
 import os
@@ -138,3 +138,59 @@ def test_tools_return_within_wait_s(tmp_path, monkeypatch):
     assert st["pending"] == ["spce_water"] and st["cases"]["spce_water"]["state"] in ("running", "queued")
     api.cancel(b["request"])
     api.cancel(r["request"])
+
+
+def test_orphaned_worker_ends_with_its_lammps_runs(tmp_path):
+    """A pool worker whose server is killed (kill -9) ends, and so does the LAMMPS process group it started."""
+    out = tmp_path / "pids"
+    child = ("import os, subprocess, sys, time; from lammps_translator import lammps, workers; "
+             "p = subprocess.Popen(['sleep', '120'], start_new_session=True); lammps._RUNNING.add(p); "
+             "workers.PARENT_POLL_S = 0.2; workers.watch_parent(); "
+             f"open({str(out)!r}, 'w').write(f'{{os.getpid()}} {{p.pid}}'); time.sleep(120)")
+    parent = (f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(120)")
+    env = dict(os.environ, PYTHONPATH=str(ROOT))
+    srv = subprocess.Popen([sys.executable, "-c", parent], env=env)
+    t0 = time.time()
+    while not (out.is_file() and out.read_text().strip()):
+        assert time.time() - t0 < 20
+        time.sleep(0.1)
+    worker, sleeper = (int(x) for x in out.read_text().split())
+    srv.kill()                                                       # the server dies without stopping its pool
+    srv.wait()
+
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        try:
+            return Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] != "Z"
+        except OSError:
+            return True
+    t0 = time.time()
+    while (alive(worker) or alive(sleeper)) and time.time() - t0 < 15:
+        time.sleep(0.2)
+    try:
+        assert not alive(worker) and not alive(sleeper)
+    finally:
+        for pid in (worker, sleeper):
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+
+
+def test_pool_workers_watch_their_parent(tmp_path, monkeypatch):
+    monkeypatch.setenv("LMPT_OUT", str(tmp_path))
+    pool = api._Pool()
+    pool.submit(tmp_path, [])
+    try:
+        r = pool.pool.apply_async(_watcher_started).get(timeout=60)
+        assert r is True
+    finally:
+        pool.pool.terminate()
+
+
+def _watcher_started():
+    from lammps_translator import workers
+    return workers._STARTED["pid"] == os.getpid()

@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run atomistic studies with LAMMPS.
-Version: 2026.11.2.1
+Version: 2026.11.7.1
 
 Tools (all JSON):
   study_format      the study format: systems, potentials, force fields, stages. Read it first.
@@ -106,14 +106,16 @@ def validate_studies(studies: dict) -> dict:
 
 @server.tool()
 @_tool
-def run_studies(studies: dict, wait_s: float = 45) -> dict:
+def run_studies(studies: dict, wait_s: float = 45, request_name: str | None = None) -> dict:
     """Builds, runs (LAMMPS) and checks each study. Per study: one result block per stage (energies, lattice
     constants, Cij, moduli, EOS fit, vacancy/surface energies, MD means and errors, RDF, diffusion), 'structure',
     'final', 'feat_material', 'checks' (reference implementation vs LAMMPS, Born stability, Cauchy, virial vs
     energy, energy drift), 'reliable', warnings and files. Returns after at most wait_s seconds: studies still
     running are listed in 'pending' with progress and ETA (with SLURM: state queued/running, job id); collect
-    them with study_status. A study's "queue": true/false forces a SLURM job / a local run."""
-    return api.run(studies, wait=min(max(float(wait_s), 0.0), 50.0))
+    them with study_status. A study's "queue": true/false forces a SLURM job / a local run. request_name
+    ('run_<id>', optional): the request folder's name, so a caller knows the path before the answer; the same name
+    again returns that request's status instead of submitting twice."""
+    return api.run(studies, wait=min(max(float(wait_s), 0.0), 50.0), request_name=request_name)
 
 
 @server.tool()

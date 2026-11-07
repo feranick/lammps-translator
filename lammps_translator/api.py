@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.2.1
+Version: 2026.11.7.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks (builds the structures, finds potential files; no LAMMPS run)
@@ -26,6 +26,7 @@ import base64
 import json
 import multiprocessing as mp
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -83,14 +84,26 @@ class _Pool:
         workers = int(os.environ.get("LMPT_WORKERS", "2"))
         timeout = float(os.environ.get("LMPT_TIMEOUT", "21600"))
         if self.pool is None:
-            self.pool = mp.get_context("spawn").Pool(workers, maxtasksperchild=10)
+            from .workers import watch_parent       # every worker (and its LAMMPS runs) ends with this server
+            self.pool = mp.get_context("spawn").Pool(workers, maxtasksperchild=10, initializer=watch_parent,
+                                                     initargs=(os.getpid(),))
         self.jobs[str(folder)] = {j["name"]: self.pool.apply_async(_run_one, (dict(j, timeout=timeout),)) for j in jobs}
 
 
 _POOL = _Pool()
 
 
-def _request_dir(prefix: str) -> Path:
+REQUEST_NAME = re.compile(r"^run_[A-Za-z0-9_.-]{1,80}$")
+
+
+def _request_dir(prefix: str, name: str | None = None) -> Path:
+    """A new request folder: <LMPT_OUT>/<prefix>_<time>_<hex>, or <LMPT_OUT>/<name> when the caller chose it
+    (request_name; FileExistsError if it is taken)."""
+    if name:
+        d = out_root() / name
+        out_root().mkdir(parents=True, exist_ok=True)
+        d.mkdir()
+        return d
     d = out_root() / f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -206,12 +219,13 @@ def _collect(folder: Path) -> dict:
     return res
 
 
-def start(studies: dict, prefix: str = "run", extra: dict | None = None, budget_s: float = 30.0) -> Path:
+def start(studies: dict, prefix: str = "run", extra: dict | None = None, budget_s: float = 30.0,
+          request_name: str | None = None) -> Path:
     """Validates, then submits each valid study: a SLURM job (LMPT_EXECUTOR=slurm and long enough, or
     "queue": true) or the local worker pool. Submissions that would run past budget_s go on in a background
     thread (their studies show as queued, 'submitting'), so a tool call returns in time."""
     t0 = time.time()
-    folder = _request_dir(prefix)
+    folder = _request_dir(prefix, request_name)
     (folder / "studies.json").write_text(json.dumps(studies, indent=1))
     invalid, jobs, where, est, natoms = {}, [], {}, {}, {}
     if not isinstance(studies, dict):
@@ -259,12 +273,31 @@ def status(request: str, wait: float = 0.0) -> dict:
         time.sleep(2.0 if res.get("pending") else 1.0)
 
 
-def run(studies: dict, wait: float | None = None) -> dict:
+def run(studies: dict, wait: float | None = None, request_name: str | None = None) -> dict:
     """Runs the studies into a new request folder under LMPT_OUT: per study <name>/ (initial.data, one folder per
     stage with in.lammps and log.lammps, run_all.sh, <name>.json; with SLURM job.sh, job.json, job.log),
-    <name>.tgz; studies.json, request.json, results.json."""
+    <name>.tgz; studies.json, request.json, results.json.
+
+    request_name ('run_<id>', optional): the folder's name, chosen by the caller (llm-translators' router) so it
+    knows the request path even when the answer does not arrive in time. Repeating a call with the same name
+    returns that request's status and submits nothing again."""
+    if request_name is not None:
+        if not isinstance(request_name, str) or not REQUEST_NAME.match(request_name):
+            return {"error": "request_name: 'run_' followed by letters, digits, _ . - (up to 80)"}
+        f = out_root() / request_name
+        if (f / "request.json").is_file():
+            res = status(str(f), 0.0 if wait is None else min(float(wait), 15.0))
+            return dict(res, note="this request_name was submitted before: its status, nothing submitted again")
+        if f.exists():
+            return {"error": f"request_name {request_name!r}: the folder exists but holds no request (still being "
+                             "submitted?); call study_status(request) in a moment", "request": str(f)}
     t0 = time.time()
-    folder = start(studies, budget_s=30.0 if wait is None else max(1.0, 0.6 * float(wait)))
+    try:
+        folder = start(studies, budget_s=30.0 if wait is None else max(1.0, 0.6 * float(wait)),
+                       request_name=request_name)
+    except FileExistsError:
+        return {"error": f"request_name {request_name!r} is being submitted by another call; call "
+                         "study_status(request) in a moment", "request": str(out_root() / request_name)}
     if wait is None:
         return status(str(folder), 1e9)
     return status(str(folder), max(0.0, float(wait) - (time.time() - t0)))

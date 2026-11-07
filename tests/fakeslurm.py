@@ -1,4 +1,4 @@
-"""fakeslurm.py — stand-ins for sbatch, squeue, scancel, sacct and sinfo (tests only). Version: 2026.11.2.1
+"""fakeslurm.py — stand-ins for sbatch, squeue, scancel, sacct and sinfo (tests only). Version: 2026.11.7.1
 
 State in $FAKE_SLURM/state.json. sbatch starts job.sh in the background (or holds it PENDING when the file
 $FAKE_SLURM/hold exists, and fails when $FAKE_SLURM/fail_submit exists); squeue reports RUNNING while the process
@@ -142,7 +142,7 @@ def scontrol(args):
     for n in nodes:
         cores = n["cpus"] // n["tpc"]
         print(f"NodeName={n['name']} Arch=x86_64 CoresPerSocket={cores} CPUAlloc=0 CPUTot={n['cpus']} "
-              f"NodeAddr={n['addr']} NodeHostName={n['hostname']} RealMemory=64000 Sockets=1 Boards=1 "
+              f"NodeAddr={n['addr']} NodeHostName={n['hostname']} RealMemory={n.get('mem', 64000)} Sockets=1 Boards=1 "
               f"State=IDLE ThreadsPerCore={n['tpc']}")
     return 0
 
