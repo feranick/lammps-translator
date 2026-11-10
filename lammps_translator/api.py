@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.7.1
+Version: 2026.11.09.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks (builds the structures, finds potential files; no LAMMPS run)
@@ -26,7 +26,6 @@ import base64
 import json
 import multiprocessing as mp
 import os
-import re
 import time
 import uuid
 from pathlib import Path
@@ -93,7 +92,7 @@ class _Pool:
 _POOL = _Pool()
 
 
-REQUEST_NAME = re.compile(r"^run_[A-Za-z0-9_.-]{1,80}$")
+from llmt_runtime.requests import REQUEST_NAME  # noqa: E402,F401 (run_<id>: the router names requests)
 
 
 def _request_dir(prefix: str, name: str | None = None) -> Path:
@@ -199,7 +198,12 @@ def _collect(folder: Path) -> dict:
     for v in out.values():
         if isinstance(v, dict):
             v.pop("trace", None)
-    res = {"request": str(folder), "translator": __version__, "done": not pending, "pending": pending,
+    # the version the studies ran with (their results', else request.json's), and translator_now when this server
+    # runs another (llmt-runtime's ran_with; before 2026.11.09.1 the installed version, whatever the run used)
+    from llmt_runtime import requests as R
+
+    from .runtime import RT
+    res = {"request": str(folder), **R.ran_with(RT, meta, out), "done": not pending, "pending": pending,
            "elapsed_s": round(time.time() - meta.get("started", time.time()), 1), "studies": out}
     if pending:
         res["progress"] = prog
@@ -242,9 +246,13 @@ def start(studies: dict, prefix: str = "run", extra: dict | None = None, budget_
         if where[n] == "local":
             jobs.append({"name": n, "study": st, "folder": str(folder)})
     names = [n for n in studies if n in where]
-    X._atomic_json(folder / "request.json", {
-        "names": names, "invalid": invalid, "started": time.time(), "executor": where, "estimate_min": est,
-        "studies": {n: studies[n] for n in names}, "translator": __version__, **(extra or {})})
+    from llmt_runtime import requests as R
+
+    from .runtime import RT
+    # with the versions it is submitted with ("translator", llmt-runtime's "runtime"): status says what it ran with
+    X._atomic_json(folder / "request.json", R.request_meta(
+        RT, names=names, invalid=invalid, started=time.time(), executor=where, estimate_min=est,
+        studies={n: studies[n] for n in names}, **(extra or {})))
     if jobs:
         _POOL.submit(folder, jobs)
     todo = [n for n in names if where[n] == "slurm"]
@@ -281,16 +289,15 @@ def run(studies: dict, wait: float | None = None, request_name: str | None = Non
     request_name ('run_<id>', optional): the folder's name, chosen by the caller (llm-translators' router) so it
     knows the request path even when the answer does not arrive in time. Repeating a call with the same name
     returns that request's status and submits nothing again."""
-    if request_name is not None:
-        if not isinstance(request_name, str) or not REQUEST_NAME.match(request_name):
-            return {"error": "request_name: 'run_' followed by letters, digits, _ . - (up to 80)"}
-        f = out_root() / request_name
-        if (f / "request.json").is_file():
-            res = status(str(f), 0.0 if wait is None else min(float(wait), 15.0))
-            return dict(res, note="this request_name was submitted before: its status, nothing submitted again")
-        if f.exists():
-            return {"error": f"request_name {request_name!r}: the folder exists but holds no request (still being "
-                             "submitted?); call study_status(request) in a moment", "request": str(f)}
+    from llmt_runtime import requests as R
+
+    from .runtime import RT
+    kind_, found = R.check_request_name(RT, request_name)     # llmt-runtime: new | repeat (its status) | error
+    if kind_ == "error":
+        return found
+    if kind_ == "repeat":
+        res = status(str(found), 0.0 if wait is None else min(float(wait), 15.0))
+        return dict(res, note=R.REPEAT_NOTE)
     t0 = time.time()
     try:
         folder = start(studies, budget_s=30.0 if wait is None else max(1.0, 0.6 * float(wait)),
@@ -459,17 +466,18 @@ def bench_status(bench: str, wait: float | None = None) -> dict:
         if not pending or time.time() >= t_end:
             break
         time.sleep(2.0)
-    out = _bench_out(folder, r)
+    out = _bench_out(folder, r, {k: res[k] for k in ("translator", "translator_now", "translator_note") if k in res})
     if pending:
         out["pending"] = pending
         out["next"] = (f"call bench_status(bench='{folder}') later to evaluate the rest. " + res.get("next", "")).strip()
     return out
 
 
-def _bench_out(folder: Path, r: dict) -> dict:
+def _bench_out(folder: Path, r: dict, ver: dict | None = None) -> dict:
+    """ver: the versions the benchmarks ran with (_collect's ran_with), else this server's."""
     passed = [k for k, v in r.items() if v.get("passed")]
     failed = [k for k, v in r.items() if v.get("passed") is False or v.get("ok") is False]
-    out = {"request": str(folder), "translator": __version__, "passed": passed, "failed": failed,
+    out = {"request": str(folder), **(ver or {"translator": __version__}), "passed": passed, "failed": failed,
            "skipped": [k for k, v in r.items() if "skipped" in v], "cases": r}
     (folder / "bench.json").write_text(json.dumps(out, indent=1, default=float))
     return out

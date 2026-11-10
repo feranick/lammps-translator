@@ -13,6 +13,7 @@ On the machine that runs LAMMPS (Ubuntu; LAMMPS 4 Jul 2026 from the Debian packa
 ```
 cd ~/Software && git clone https://github.com/feranick/lammps-translator.git    # or: cd lammps-translator && git pull
 source ~/Software/build123d-translator/.venv/bin/activate                          # shared venv (alias cad)
+pip install -e "$HOME/Software/llmt-runtime"     # the translators' shared runtime, first (or: pip install -r requirements-standalone.txt)
 pip install -e "$HOME/Software/lammps-translator[mcp,test]"
 lmpt status            # LAMMPS found? version, packages, potentials folders, fea-translator
 pytest -q              # 80 tests: 69 run anywhere (SLURM ones with fake sbatch/squeue/scontrol), 11 need LAMMPS
@@ -188,6 +189,7 @@ tests/test_lmpt.py  tests/test_slurm.py  tests/test_server.py  tests/fakeslurm.p
 
 | version | changes |
 |---|---|
+| 2026.11.09.1 | lmpt moves onto **llmt-runtime** (needs `llmt-runtime>=2026.11.09.3`), phase 1. A LAMMPS run killed for memory is said as such: `state: out_of_memory` with the job's or the node's scope (llmt-runtime's cgroup counters and node memory, `OomWatch`), where every SIGKILL read "timed out after ... (LMPT_TIMEOUT)" and under SLURM the study ended `timed_out`; a real time-out stays one. How a SLURM job that left the queue ended (`ended_state`) is llmt-runtime's: SLURM's wording `Detected N oom_kill events in StepId=...` gives `out_of_memory` whatever sacct says (lmpt matched 'oom' and 'kill' only without accounting), the advice names `run.mem` instead of `--mem` in `LMPT_SLURM_ARGS`, and `CANCELLED by <uid>` keeps who (only its first word was kept). Worker processes: `workers.py` is llmt-runtime's with `lammps.kill_all` as its cleanup (a SIGTERM to a worker, as the stale-server exit's `pool.terminate()` sends, now ends its LAMMPS runs, which ran on in their own sessions). `request.json` records `translator` and `runtime`; `study_status` and `bench_status` report the version the studies ran with (`translator_now` when the server runs another: they reported the installed version). `request_name` is llmt-runtime's. `tool_status().executor.runtime`. Versions now carry two-digit months and days (`2026.11.09.1`; pip reads both forms alike). Why: the four translators each had their own copy of this code and had drifted; fixes now land once. Phase 2 (the SLURM layer) and phase 3 (the MCP server's stale handling, `stale.py`) follow. |
 | 2026.11.7.1 | The node's memory caps `run.mem` (`caps.mem`, `mem_mb`, `mem_from`; validation refuses more; the automatic `--mem` stays within it), as cfdt 2026.11.07.1. Pool workers end with their server and stop their LAMMPS runs (`workers.py`, as cfdt and feat). `run_studies(request_name=...)`: idempotent, router-named requests. 80 tests. |
 | 2026.11.2.1 | Packaging: `license = "MIT"` (an SPDX string; the TOML table is deprecated in setuptools 77 and refused from 2027-02-18), `setuptools>=77` to build. No code change. |
 | 2026.10.25.2 | Tests: the two-node tests no longer depend on the machine's host name (on spark-5da5, `deploy --test` matched the real host name to the fake node of the same name). |

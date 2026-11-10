@@ -1,5 +1,5 @@
 """runner.py — one study end to end: build, write inputs stage by stage, run LAMMPS, read, analyse, check.
-Version: 2026.11.7.1
+Version: 2026.11.09.1
 
 Folder layout (<request>/<study>/):
     initial.data, potentials/, 00_setup/ (in.lammps, log.lammps, forces0.dump), 01_<stage>/ ..., run_all.sh,
@@ -73,6 +73,15 @@ def stage_names(stages: list) -> list[str]:
 
 class Cancelled(RuntimeError):
     pass
+
+
+class OutOfMemory(RuntimeError):
+    """A LAMMPS run killed for memory (llmt-runtime's classification): scope 'job' (its limit: more run.mem helps)
+    or 'node' (the node ran out: run when it is free)."""
+
+    def __init__(self, msg: str, scope: str | None = None):
+        super().__init__(msg)
+        self.scope = scope
 
 
 def write_json_atomic(path: Path, obj) -> None:
@@ -154,6 +163,8 @@ class Study:
         log = read_log(d / "log.lammps")
         if r.get("cancelled"):
             raise Cancelled(f"cancelled with cancel() during {sid}")
+        if r.get("out_of_memory"):      # killed for memory (llmt-runtime's verdict): not a time-out, not a crash
+            raise OutOfMemory(f"{sid}: {r['stderr']}", r.get("oom_scope"))
         if not (d / "log.lammps").is_file():
             why = r.get("error") or r.get("stderr") or f"exit code {r['rc']}"
             raise RuntimeError(f"LAMMPS did not start in {sid} ({r.get('command', '')}): {why[:800]}")
@@ -593,6 +604,9 @@ def run_study(name: str, study: dict, folder: Path, timeout: float = 3600.0, pro
         res.update({"ok": False, "why": str(exc)[:1500]})
         if isinstance(exc, Cancelled):
             res["state"] = "cancelled"
+        if isinstance(exc, OutOfMemory):
+            res["state"] = "out_of_memory"
+            res["oom_scope"] = exc.scope
         if not isinstance(exc, (ValueError, RuntimeError)):
             res["trace"] = traceback.format_exc()[-3000:]
         if "structure" not in res and hasattr(st, "s0"):

@@ -1,51 +1,34 @@
-"""workers.py — lmpt's worker processes end with the server that started them.
-Version: 2026.11.7.1
+"""workers.py — lmpt's worker processes end with the server that started them (from llmt-runtime).
+Version: 2026.11.09.1
 
     watch_parent(ppid)   initializer of the study pool (api._Pool): a daemon thread ends the worker, and the LAMMPS
-                         process groups it started (lammps.kill_all), when its parent is gone
+                         process groups it started (lammps.kill_all), when its parent (or the server ppid) is gone;
+                         SIGTERM (Pool.terminate, the stale-server exit) does the same
 
-A spawned multiprocessing worker holds both ends of its own task queue, so it never sees EOF when the MCP server
-dies (a crash, kill -9, an app restart) and would wait forever, holding its release "in use" for llmt gc; one in the
-middle of a local run would also leave mpirun and its LAMMPS ranks running (they are in their own session, so a
-signal to the worker does not reach them). The stale-server exit terminates the pool itself (stale.py); this is the
-backstop for everything else, as cfdt 2026.11.07.2 and feat do (llm-translators docs/create_new_translators.md).
-
-Not PR_SET_PDEATHSIG: on Linux it fires when the *thread* that created the child exits, and the pool is created
-from the MCP server's call threads, which come and go. The worker polls os.getppid() instead (PARENT_POLL_S): when
-the parent dies the worker is re-parented and its parent pid changes. SLURM jobs do not depend on the server.
+The code is llmt-runtime's workers module (llmt_runtime.workers): polling os.getppid(), not PR_SET_PDEATHSIG (it fires
+when the *thread* that created the child exits, and the pool is created from the MCP server's call threads). lmpt's own
+list of LAMMPS runs (lammps.kill_all) is the runtime's on_orphan cleanup. Before 2026.11.09.1 the stale-server exit's
+pool.terminate() ended the workers at once and their mpirun and LAMMPS ranks, in their own sessions, ran on.
 """
 from __future__ import annotations
 
-import os
-import threading
-import time
+from llmt_runtime import workers as _W
 
-PARENT_POLL_S = 1.0
-_STARTED = {"pid": None}        # the process the watcher runs in (a fork would inherit the flag)
+PARENT_POLL_S = _W.PARENT_POLL_S
+_STARTED = _W._STARTED
 
 
-def _orphaned() -> None:
+def _kill_lammps() -> None:
     try:
         from .lammps import kill_all
         kill_all()
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 (the worker ends anyway)
         pass
-    os._exit(0)
 
 
 def watch_parent(ppid: int | None = None) -> None:
-    """Starts (once per process) a daemon thread that ends this process, and the LAMMPS runs it started, when its
-    parent `ppid` (default: the parent now) is gone."""
-    if _STARTED["pid"] == os.getpid():
-        return
-    _STARTED["pid"] = os.getpid()
-    ppid = int(ppid or os.getppid())
-    if os.getppid() != ppid:      # the parent died before the worker started
-        _orphaned()
-
-    def loop():
-        while True:
-            time.sleep(PARENT_POLL_S)
-            if os.getppid() != ppid:
-                _orphaned()
-    threading.Thread(target=loop, daemon=True, name="lmpt-parent-watch").start()
+    """Starts (once per process) the watcher that ends this worker, and the LAMMPS runs it started, when its parent
+    `ppid` (default: the parent now) is gone (llmt_runtime.workers.watch_parent)."""
+    _W.PARENT_POLL_S = PARENT_POLL_S       # (a test may set a shorter poll here)
+    _W.on_orphan(_kill_lammps)
+    _W.watch_parent(ppid, name="lmpt")

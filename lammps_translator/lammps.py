@@ -1,5 +1,5 @@
 """lammps.py — the only module that runs LAMMPS: finds the executable, reads its capabilities, runs inputs.
-Version: 2026.11.7.1
+Version: 2026.11.09.1
 
 Executable: LMPT_LMP (a command, e.g. 'lmp', '/opt/lammps/bin/lmp_mpi' or 'mpirun -np 4 lmp'), else the first of
 lmp, lmp_mpi, lmp_serial, lmp_stable, lmp_openmpi, lammps on the PATH, else the same names in /usr/bin,
@@ -191,6 +191,8 @@ def run(input_name: str, log_name: str, cwd: Path, procs: int = 1, timeout: floa
     env.setdefault("OMP_NUM_THREADS", "1")
     t0 = time.perf_counter()
     cancel = Path(cwd).parent / "CANCEL"      # written by api.cancel for a local study
+    from llmt_runtime.memory import OomWatch
+    watch = OomWatch()                        # cgroup counters and the node's memory: was it killed for memory?
     try:
         p = subprocess.Popen(full, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
                              start_new_session=True)
@@ -198,7 +200,7 @@ def run(input_name: str, log_name: str, cwd: Path, procs: int = 1, timeout: floa
         return {"rc": -1, "seconds": 0.0, "stderr": str(exc), "command": " ".join(full)}
     _RUNNING.add(p)
     try:
-        return _wait(p, full, t0, cancel, timeout)
+        return _wait(p, full, t0, cancel, timeout, watch, procs)
     finally:
         _RUNNING.discard(p)
 
@@ -213,27 +215,40 @@ def kill_all() -> None:
             _kill(p)
 
 
-def _wait(p, full, t0, cancel, timeout) -> dict:
-    cancelled = False
+def _wait(p, full, t0, cancel, timeout, watch=None, procs: int = 1) -> dict:
+    """Waits for the run (killing it on cancel or after timeout). A run that ended otherwise with an error is asked
+    whether it was killed for memory (llmt-runtime's OomWatch: the cgroup counters, the kernel's word, the node's
+    memory). Before 2026.11.09.1 every SIGKILL read 'timed out', also a kill by the out-of-memory killer, and under
+    SLURM the study then ended as timed_out."""
+    cancelled = timed_out = False
     rc = None
     while rc is None:
         try:
             out, err = p.communicate(timeout=1.0)
             rc = p.returncode
         except subprocess.TimeoutExpired:
+            if watch is not None:
+                watch.sample()
             el = time.perf_counter() - t0
             if cancel.is_file() or el > timeout:
                 cancelled = cancel.is_file()
+                timed_out = not cancelled
                 _kill(p)
                 out, err = p.communicate()
                 rc = -9
                 err = (err or "") + ("\ncancelled" if cancelled else f"\ntimed out after {timeout:g} s")
     msg = ((err or "")[-2000:] + (out or "")[-1000:]).replace("\x00", "")
-    if rc == -9 and not cancelled:
+    if timed_out:
         msg = f"timed out after {timeout:g} s (LMPT_TIMEOUT)"
     res = {"rc": rc, "seconds": round(time.perf_counter() - t0, 3), "stderr": msg.strip(), "command": " ".join(full)}
     if cancelled:
         res["cancelled"] = True
+    elif rc not in (0, None) and not timed_out and watch is not None:
+        rec = watch.classify(rc, 0.0, p.pid, procs)
+        if rec["out_of_memory"]:
+            from llmt_runtime.memory import oom_message
+            res.update(out_of_memory=True, oom_scope=rec["oom_scope"], memory=rec)
+            res["stderr"] = oom_message(rec, "LAMMPS", "use a smaller cell (fewer atoms)", unit="rank")
     return res
 
 

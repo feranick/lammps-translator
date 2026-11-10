@@ -1,5 +1,9 @@
 """executor.py — where studies run: the local worker pool or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.7.1
+Version: 2026.11.09.1
+
+From 2026.11.09.1 how a job that left the queue ended (ended_state) is llmt-runtime's (llmt_runtime.jobs.classify_end,
+with lmpt's out-of-memory advice: run.mem), and status() reports llmt-runtime's version ("runtime"); the rest of the
+SLURM layer moves in phase 2.
 
 Settings (environment): LMPT_EXECUTOR local | slurm (local); LMPT_SLURM_MIN_MINUTES (1): studies estimated
 shorter run locally; LMPT_SLURM_ARGS: extra sbatch arguments; LMPT_PROCS (MPI ranks, --ntasks); LMPT_TIMEOUT
@@ -297,6 +301,8 @@ def status() -> dict:
            "slurm_args": os.environ.get("LMPT_SLURM_ARGS", ""), "workers": int(os.environ.get("LMPT_WORKERS", "2")),
            "timeout_s": timeout_s(), "atoms_per_rank": atoms_per_rank(), "caps": caps(),
            "run_keys": "a study's run {timeout_s, mem, procs, queue} overrides these for itself, within caps"}
+    from llmt_runtime import __version__ as runtime_version
+    out["runtime"] = runtime_version             # llmt-runtime's version (machines() and llmt status show it)
     plan = node_plan()
     out["node"] = {k: plan.get(k) for k in ("setting", "nodelist", "cluster_nodes", "this_node")}
     out["node"]["cores"] = node_cores()
@@ -715,7 +721,7 @@ def _sacct(jid: str) -> str | None:
     for ln in out.splitlines():
         s = ln.strip()
         if s:
-            return s.split()[0].upper()
+            return s           # whole: 'CANCELLED by 1000' keeps who (before 2026.11.09.1 only its first word)
     return None
 
 
@@ -738,39 +744,31 @@ def _time_hint(d: Path) -> str:
 
 
 def ended_state(d: Path, jid: str) -> dict:
-    """A job that left the queue without a result: what happened."""
+    """A job that left the queue without a result: what happened. cancel()'s cancelled.json first; a job sacct still
+    sees as pending or running is that; else llmt-runtime's rules (jobs.classify_end: sacct's state, else job.log;
+    SLURM's out-of-memory wording 'Detected N oom_kill events' whatever sacct says), with lmpt's out-of-memory advice
+    (runtime.oom_advice: run.mem) and its time-limit hint."""
     log = d / "job.log"
     tail = _tail(log)
     if (d / "cancelled.json").is_file():
         c = json.loads((d / "cancelled.json").read_text())
         return {"state": "cancelled", "why": f"cancelled by {c.get('by', 'cancel()')} at {c.get('at', '?')}"}
     s = _sacct(jid)
-    if s:
-        if s.startswith("TIMEOUT") or s.startswith("DEADLINE"):
-            return {"state": "timed_out", "why": f"the job hit its SLURM time limit ({s}){_time_hint(d)}: raise LMPT_TIMEOUT "
-                                                 "(the job asks for it + 10 min) or shorten the study (fewer MD steps, "
-                                                 "a smaller cell), or give it more procs"}
-        if s.startswith("OUT_OF_ME"):
-            return {"state": "out_of_memory", "why": "out of memory: add --mem=... to LMPT_SLURM_ARGS, or use a "
-                                                     "smaller cell"}
-        if s.startswith("CANCELLED"):
-            by = s.split("BY", 1)[1].strip() if "BY" in s else None
-            return {"state": "cancelled", "why": "cancelled" + (f" by uid {by}" if by else "")}
-        if s in ("PENDING", "RUNNING", "COMPLETING", "REQUEUED", "SUSPENDED", "CONFIGURING"):
-            return {"state": "running" if s != "PENDING" else "queued", "why": None}
-        if s.startswith("COMPLETED"):
-            return {"state": "failed", "why": "the job ended without writing a result", "log_tail": tail}
-        return {"state": "failed", "why": f"SLURM state {s}", "log_tail": tail}
-    # no accounting: read job.log
-    if "DUE TO TIME LIMIT" in tail:
-        return {"state": "timed_out", "why": "the job hit its SLURM time limit (job.log)" + _time_hint(d) +
-                                             ": raise LMPT_TIMEOUT or shorten the study"}
-    if "CANCELLED" in tail:
-        return {"state": "cancelled", "why": "cancelled (job.log)"}
-    if "oom" in tail.lower() and "kill" in tail.lower():
-        return {"state": "out_of_memory", "why": "out of memory (job.log): add --mem=... to LMPT_SLURM_ARGS"}
-    return {"state": "failed", "why": "the job is gone without a result" + ("" if log.is_file() else " (no job.log)"),
-            "log_tail": tail}
+    first = s.split()[0].upper() if s else ""
+    if first in ("PENDING", "RUNNING", "COMPLETING", "REQUEUED", "SUSPENDED", "CONFIGURING"):
+        return {"state": "running" if first != "PENDING" else "queued", "why": None}
+    from llmt_runtime import jobs as J
+
+    from .runtime import RT
+    try:
+        job = json.loads((d / "job.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        job = {}
+    state, why = J.classify_end(RT, s, tail, has_log=log.is_file(), folder=d, job=job)
+    out = {"state": state, "why": why}
+    if state == "failed":
+        out["log_tail"] = tail
+    return out
 
 
 def study_state(request: Path, name: str, q: dict | None) -> dict:
