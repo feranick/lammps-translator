@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run atomistic studies with LAMMPS.
-Version: 2026.11.7.1
+Version: 2026.11.09.4
 
 Tools (all JSON):
   study_format      the study format: systems, potentials, force fields, stages. Read it first.
@@ -17,17 +17,22 @@ Every tool returns within its wait_s (at most 50 s): LAMMPS runs in worker proce
 call's thread (each tool runs in a worker thread, off the event loop). A server whose code is no longer the
 installed one refuses calls with STALE_SERVER while idle, and exits (stale.py, llm-translators docs/SHARED.md).
 
+From 2026.11.09.4 every tool is wrapped by llmt-runtime's Server (stale.GUARD.tool(ToolError)): a worker thread, a
+call deadline of 48 s (llmt_runtime.server.BUDGET_S: SLURM commands, submissions and waits keep within it), errors as
+ToolError with their text, each call in the server's log ($LMPT_OUT/.server); main() calls GUARD.serve() (the install
+watch, the log, SIGTERM/SIGHUP/SIGINT stop the workers first) and runs the background work of a call (the rest of a
+request's submissions, a benchmark's fea-translator chain) through GUARD.start_background, so a stale exit waits for
+it.
+
 Run:  lmpt-mcp                       (stdio)
       lmpt-mcp --http 8769 [--host 0.0.0.0]
 """
 from __future__ import annotations
 
 import argparse
-import functools
 
-import anyio.to_thread
-
-from . import api, executor, stale
+from . import api, executor  # noqa: F401
+from .stale import GUARD
 
 try:  # MCP Python SDK 2.x
     from mcp.server.mcpserver import MCPServer as _Server
@@ -62,33 +67,14 @@ eV, A, GPa, K, ps, g/cm3, J/m2."""
 
 server = _Server("lammps-translator", instructions=INSTRUCTIONS)
 
-
-def _tool(fn):
-    """Every tool: counted in and out (stale servers, stale.py), run in a worker thread (run_studies and
-    study_status wait up to 50 s; on the event loop they would block other requests and pings), and any exception
-    re-raised as a ToolError with its message (MCP SDK 2.x passes on only a ToolError's text)."""
-    @functools.wraps(fn)
-    async def wrap(*args, **kwargs):
-        refused = stale.enter_call()
-        if refused:
-            raise ToolError(refused)
-        try:
-            r = await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
-        except ToolError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - its text must reach the caller
-            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
-        finally:
-            stale.leave_call()
-        n = stale.note()
-        if n and isinstance(r, dict):
-            r = {**r, "server_stale": n}
-        return r
-    return wrap
+# Every tool is wrapped by GUARD.tool(ToolError) (llmt-runtime's Server.tool, which replaced this module's _tool in
+# 2026.11.09.4): counted in and out (stale servers), run in a worker thread (run_studies and study_status wait up to
+# 50 s; on the event loop they would block other requests and pings) under the 48 s call deadline, and any exception
+# re-raised as a ToolError with its message (MCP SDK 2.x passes on only a ToolError's text).
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def study_format() -> dict:
     """The study format: systems (lattices, molecules, data files), potentials and force fields, stage kinds
     with their parameters, conventions, an example; and the LAMMPS version, packages and potential folders."""
@@ -96,7 +82,7 @@ def study_format() -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def validate_studies(studies: dict) -> dict:
     """Static checks of studies given as {name: study}: builds each structure and finds its potential files.
     Returns per study ok, errors (each says what to fix), warnings, and for a valid study its estimate
@@ -105,7 +91,7 @@ def validate_studies(studies: dict) -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def run_studies(studies: dict, wait_s: float = 45, request_name: str | None = None) -> dict:
     """Builds, runs (LAMMPS) and checks each study. Per study: one result block per stage (energies, lattice
     constants, Cij, moduli, EOS fit, vacancy/surface energies, MD means and errors, RDF, diffusion), 'structure',
@@ -119,7 +105,7 @@ def run_studies(studies: dict, wait_s: float = 45, request_name: str | None = No
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def study_status(request: str, wait_s: float = 45) -> dict:
     """The studies of a run_studies request (its 'request' path): finished ones with their results, the others
     in 'pending' with progress and state (queued: reason, expected_start, ahead; running: stage, eta_min_max,
@@ -129,7 +115,7 @@ def study_status(request: str, wait_s: float = 45) -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def get_inputs(study: dict, name: str = "study") -> dict:
     """Builds one study and writes its LAMMPS inputs without running: the structure summary, every stage's
     in.lammps as text and the head of the data file."""
@@ -137,7 +123,7 @@ def get_inputs(study: dict, name: str = "study") -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def jobs(limit: int = 20, active: bool = False) -> dict:
     """The newest requests that have SLURM jobs (from any conversation), each study's state, job id and ETA;
     queue {running, queued, cpus_in_use} for this translator's jobs; machine {cpus, cpus_allocated}.
@@ -146,7 +132,7 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def cancel(request: str, names: list[str] | None = None) -> dict:
     """Stops a request's studies (all, or the named ones): scancel for SLURM jobs; a local study only if this
     server process runs it. Returns what was cancelled and the request's states."""
@@ -154,7 +140,7 @@ def cancel(request: str, names: list[str] | None = None) -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def run_benchmarks(names: list[str] | None = None, request: str | None = None, wait_s: float = 30) -> dict:
     """Submits the benchmark studies with known answers (LJ lattice sums, Madelung constants, Cauchy relation,
     Cu EAM and Si Tersoff published values, equipartition, NVE conservation; slow: spce_water; chain with
@@ -167,7 +153,7 @@ def run_benchmarks(names: list[str] | None = None, request: str | None = None, w
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def bench_status(bench: str, wait_s: float = 30) -> dict:
     """The benchmarks of a run_benchmarks request (its 'request' path): pass or fail for the finished cases,
     the others in 'pending'. Waits up to wait_s seconds (at most 50)."""
@@ -175,10 +161,18 @@ def bench_status(bench: str, wait_s: float = 30) -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def get_file(path: str, max_mb: float = 20) -> dict:
     """A file written by run_studies (a path from its result) as base64."""
     return api.read_file(path, max_mb)
+
+
+def serve() -> None:
+    """This process is the MCP server: work a call leaves running (api.background) goes through
+    GUARD.start_background, so a stale exit waits for it; then GUARD.serve(): the install watch, the server's log in
+    $LMPT_OUT/.server, signal handlers that stop the workers first."""
+    api.BACKGROUND = GUARD.start_background
+    GUARD.serve()
 
 
 def main() -> None:
@@ -186,7 +180,7 @@ def main() -> None:
     ap.add_argument("--http", type=int, help="serve MCP over streamable HTTP on this port (default: stdio)")
     ap.add_argument("--host", default="127.0.0.1")
     a = ap.parse_args()
-    stale.serve()
+    serve()
     if a.http is None:
         server.run()
     elif _V2:

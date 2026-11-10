@@ -1,5 +1,8 @@
 """cli.py — command line: lmpt format | validate | run | inputs | bench | status | jobs | cancel | run-study
-Version: 2026.11.7.1
+Version: 2026.11.09.4
+
+Interrupted (Ctrl-C) while `run` or `bench` waits for SLURM jobs, the command says which jobs are left in the queue
+and how to cancel them (scancel <ids>, lmpt cancel REQUEST, cancel(request)); it cancels nothing and exits with 130.
 """
 from __future__ import annotations
 
@@ -56,6 +59,15 @@ def main(argv=None) -> int:
     p.add_argument("request")
     p.add_argument("name")
     a = ap.parse_args(argv)
+    if a.cmd == "run-study":
+        return api.run_one(a.request, a.name)
+    try:
+        return _command(a)
+    except KeyboardInterrupt:     # run / bench printed the SLURM jobs left in the queue (api.run, api.bench)
+        return 130
+
+
+def _command(a) -> int:
     if a.cmd == "format":
         print(json.dumps(api.study_format(), indent=1))
     elif a.cmd == "status":
@@ -85,8 +97,6 @@ def main(argv=None) -> int:
         for k, v in r["inputs"].items():
             print(f"===== {k}\n{v}\n")
         print(f"written to {r['folder']}")
-    elif a.cmd == "run-study":
-        return api.run_one(a.request, a.name)
     elif a.cmd == "jobs":
         print(json.dumps(api.jobs(a.limit, a.active), indent=1))
     elif a.cmd == "cancel":

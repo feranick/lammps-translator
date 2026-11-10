@@ -1,10 +1,12 @@
 """lmpt on llmt-runtime: the shared pieces are the runtime's, configured for lmpt (2026.11.09.1, phase 1: workers, out
 of memory, ended_state, versions; a LAMMPS run killed for memory is out of memory, not timed out. 2026.11.09.3, phase
-2: the SLURM layer, with lmpt's sizing as hooks).
-Version: 2026.11.09.3
+2: the SLURM layer, with lmpt's sizing as hooks. 2026.11.09.4, phase 3: the MCP server's common code, stale.GUARD).
+Version: 2026.11.09.4
 """
+import asyncio
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -281,3 +283,148 @@ def test_budgeted_submission_still_says_submitting(slurm, monkeypatch):
         time.sleep(0.2)
     st = X.study_state(folder, "a", X.queue())
     assert st["state"] == "queued" and st["job_id"] == "1001"
+
+
+# ---- 2026.11.09.4, phase 3: the MCP server's common code is llmt-runtime's server.Server (stale.GUARD): stale servers,
+# the tool wrapper with a 48 s call deadline, background work the stale exit waits for, the server's log, signals
+
+def _guard(monkeypatch, **state):
+    """stale.GUARD with these state values for one test (restored after it); its exit is recorded, not run."""
+    from lammps_translator import stale
+    g = stale.GUARD
+    base = {"serving": False, "inflight": 0, "background": 0, "exiting": False, "checked": 0.0, "why": None,
+            "shared": False}
+    for k, v in {**base, **state}.items():
+        monkeypatch.setitem(g.state, k, v)
+    exits = []
+    monkeypatch.setattr(g, "exit_soon", lambda why, delay: exits.append(why))
+    return g, exits
+
+
+def _stale_checkout(where: Path) -> Path:
+    """A lammps_translator folder whose __init__.py carries another version (a checkout updated in place)."""
+    pkg = where / "checkout" / "lammps_translator"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text('__version__ = "2001.01.01.1"\n')
+    return pkg
+
+
+def test_server_guard_is_the_runtimes_configured_for_lmpt(monkeypatch):
+    from llmt_runtime import server as LS
+
+    from lammps_translator import stale
+    g = stale.GUARD
+    assert isinstance(g, LS.Server) and g.rt is RT and g.pkg_dir == Path(api.__file__).resolve().parent
+    assert g.busy is stale.pool_busy and g.shutdown is stale.stop_workers
+    assert stale.STATE is g.state and stale.STALE_MARK == LS.STALE_MARK == "STALE_SERVER"
+    assert stale.stale_reason is LS.stale_reason and LS.BUDGET_S == 48.0
+    monkeypatch.delenv("LMPT_STALE_CHECK_S", raising=False)
+    assert LS.Server(RT, api.__file__).period == 10.0                # lmpt's own default was 20 s
+    monkeypatch.setenv("LMPT_STALE_CHECK_S", "20")
+    assert LS.Server(RT, api.__file__).period == 20.0
+
+    class _Pool:                                                     # the exit stops the pool (workers.stop_pool)
+        _pool: list = []
+        terminated = False
+
+        def terminate(self):
+            self.terminated = True
+    p = _Pool()
+    monkeypatch.setattr(api._POOL, "pool", p)
+    stale.stop_workers()
+    assert p.terminated
+
+
+def test_tool_errors_keep_their_text_and_calls_have_a_deadline(monkeypatch):
+    m = pytest.importorskip("lammps_translator.mcp_server")
+    from llmt_runtime import server as LS
+    g, _ = _guard(monkeypatch)
+    monkeypatch.setattr(g, "busy", lambda: False)
+    assert m.GUARD is g
+    monkeypatch.setattr(api, "jobs", lambda limit=20, active=False: {"left": S.remaining()})
+    r = asyncio.run(m.jobs())
+    assert 40 < r["left"] <= LS.BUDGET_S and "server_stale" not in r   # no deadline before 2026.11.09.4
+    assert S.remaining() is None and g.state["inflight"] == 0
+
+    def boom(limit=20, active=False):
+        raise ValueError("boom")
+    monkeypatch.setattr(api, "jobs", boom)
+    with pytest.raises(m.ToolError, match="ValueError: boom"):
+        asyncio.run(m.jobs())
+    assert g.state["inflight"] == 0
+
+
+def test_stale_checkout_refuses_when_idle_and_answers_when_busy(tmp_path, monkeypatch):
+    """A checkout whose __init__.py now carries another version: with LMPT_EXIT_WHEN_STALE=1 an idle server refuses
+    with STALE_SERVER (and exits), a busy one answers with server_stale; without it (a checkout) it only answers."""
+    m = pytest.importorskip("lammps_translator.mcp_server")
+    g, exits = _guard(monkeypatch, serving=True)
+    monkeypatch.setattr(g, "pkg_dir", _stale_checkout(tmp_path))
+    monkeypatch.setattr(api, "jobs", lambda limit=20, active=False: {"requests": []})
+    monkeypatch.setattr(g, "busy", lambda: False)
+    r = asyncio.run(m.jobs())                                        # default: a checkout does not exit
+    assert r["server_stale"] == (f"version 2001.01.01.1 is installed; this server runs {__version__}: this answer "
+                                 "comes from the old code; restart the MCP server") and not exits
+    monkeypatch.setenv("LMPT_EXIT_WHEN_STALE", "1")
+    monkeypatch.setattr(g, "busy", lambda: True)                     # a study in the pool: answers, exits later
+    r = asyncio.run(m.jobs())
+    assert r["requests"] == [] and r["server_stale"].endswith("the server restarts when idle") and not exits
+    monkeypatch.setattr(g, "busy", lambda: False)
+    with pytest.raises(m.ToolError) as e:
+        asyncio.run(m.jobs())
+    assert str(e.value) == (f"STALE_SERVER: version 2001.01.01.1 is installed; this server runs {__version__}. This "
+                            "server is exiting so that the next one runs the installed version: call again.")
+    assert exits == [f"version 2001.01.01.1 is installed; this server runs {__version__}"]
+
+
+def test_background_submission_keeps_the_server_busy(slurm, tmp_path, monkeypatch):
+    """In a server the rest of a request's submissions (past run_studies' budget) runs through GUARD.start_background:
+    the server is busy until it ends, so a stale server answers instead of exiting (before 2026.11.09.4 the stale
+    exit killed the 'lmpt-submit' thread). Without a server (api.BACKGROUND None) it is a plain thread, as before."""
+    g, exits = _guard(monkeypatch, serving=True)
+    monkeypatch.setattr(g, "busy", lambda: False)
+    monkeypatch.setattr(api, "BACKGROUND", g.start_background)      # as mcp_server.serve() sets it
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    monkeypatch.setenv("FAKE_SBATCH_SLEEP", "2")                       # each sbatch takes 2 s
+    assert g.idle()
+    folder = api.start({"a": {**LJ, "queue": True}}, budget_s=0.0)
+    assert g.state["background"] == 1 and not g.idle()
+    assert any(t.name == "lmpt-submit" and not t.daemon for t in threading.enumerate())
+    monkeypatch.setattr(g, "pkg_dir", _stale_checkout(tmp_path))     # stale meanwhile, and allowed to exit
+    monkeypatch.setenv("LMPT_EXIT_WHEN_STALE", "1")
+    assert g.enter_call() is None and not exits                       # busy with the submission: answered
+    g.leave_call()
+    t0 = time.time()
+    while g.state["background"]:
+        assert time.time() - t0 < 60
+        time.sleep(0.2)
+    assert J.read_job(folder / "a")["job_id"] == "1001" and g.idle()
+
+
+def test_interrupted_run_and_bench_name_the_queued_jobs_and_cancel_nothing(slurm, tmp_path, monkeypatch, capsys):
+    """Ctrl-C while `lmpt run` or `lmpt bench` waits for SLURM jobs: the job ids still queued and how to cancel them
+    (scancel, lmpt cancel, cancel(request)) on stderr, nothing cancelled, exit 130 (as cfd-translator 2026.11.09.4)."""
+    from lammps_translator import bench as B
+    from lammps_translator import cli
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    f = tmp_path / "studies.json"
+    f.write_text(json.dumps({"a": {**LJ, "queue": True}}))
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(api, "status", interrupted)                  # interrupted while `lmpt run` waits
+    assert cli.main(["run", str(f)]) == 130
+    out = capsys.readouterr()
+    req = next((tmp_path / "runs").glob("run_*"))
+    assert out.out == "" and f"interrupted: SLURM job 1001 of {req} is still in the queue" in out.err
+    assert "nothing was cancelled" in out.err and "scancel 1001" in out.err and f"lmpt cancel {req}" in out.err
+    assert "cancel(request)" in out.err
+    monkeypatch.setattr(B, "prepare", lambda names: ({"c": dict(LJ)}, {}))
+    monkeypatch.setattr(api, "bench_status", interrupted)            # interrupted while `lmpt bench` waits
+    assert cli.main(["bench", "--queue"]) == 130
+    err = capsys.readouterr().err
+    breq = next((tmp_path / "runs").glob("bench_*"))
+    assert f"SLURM job 1002 of {breq}" in err and "scancel 1002" in err and "job 1001" not in err
+    for jid, folder in (("1001", req / "a"), ("1002", breq / "c")):
+        assert J.read_job(folder)["job_id"] == jid and not (folder / "cancelled.json").exists()
+        assert json.loads((slurm / "jobs" / f"{jid}.json").read_text())["state"] == "PENDING"

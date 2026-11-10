@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.09.3
+Version: 2026.11.09.4
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks (builds the structures, finds potential files; no LAMMPS run)
@@ -20,6 +20,13 @@ Studies run in worker processes with a time limit each, or (LMPT_EXECUTOR=slurm)
 queue position, sacct, scancel and machine CPUs; run_studies keeps its budgeted submission). Environment: LMPT_OUT
 (default ~/lmpt_runs), LMPT_WORKERS (2), LMPT_TIMEOUT (seconds per study, 21600), LMPT_LMP (LAMMPS command), LMPT_PROCS (MPI ranks, 1), LMPT_MPIRUN (mpirun), LMPT_POTENTIALS (extra
 potential folders, ':'-separated), LMPT_EXECUTOR, LMPT_SLURM_MIN_MINUTES (1), LMPT_SLURM_ARGS.
+
+2026.11.09.4 (phase 3): work a call leaves running (the rest of a request's SLURM submissions, a benchmark's
+fea-translator chain) starts with background(): a plain thread, or in the MCP server (mcp_server.serve sets
+BACKGROUND) llmt-runtime's Server.start_background, so a stale-server exit waits for it. Within an MCP call (its
+48 s deadline, llmt_runtime.slurm.remaining()), waits end a few seconds before the deadline and run_studies'
+submission budget (60 % of the wait) is taken of what is left; outside a call (the CLI, tests) nothing changes.
+`lmpt run` and `lmpt bench` interrupted while waiting print the SLURM jobs left in the queue (executor.queued_note).
 """
 from __future__ import annotations
 
@@ -27,9 +34,11 @@ import base64
 import json
 import multiprocessing as mp
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Callable
 
 from . import __version__
 from . import executor as X
@@ -94,6 +103,31 @@ _POOL = _Pool()
 
 
 from llmt_runtime.requests import REQUEST_NAME  # noqa: E402,F401 (run_<id>: the router names requests)
+
+# How work that outlives a call starts: None, a plain thread; the MCP server sets llmt-runtime's
+# Server.start_background (mcp_server.serve), which counts it as busy until it ends, so a stale exit waits for it
+BACKGROUND: Callable | None = None
+
+
+def background(fn: Callable, *args, name: str, daemon: bool = False) -> threading.Thread:
+    """Runs fn(*args) in a thread that outlives the call: through BACKGROUND in a server (non-daemon, counted by the
+    server's guard), else a plain thread (daemon as asked: tests and the CLI)."""
+    if BACKGROUND is not None:
+        return BACKGROUND(fn, *args, name=name)
+    t = threading.Thread(target=fn, args=args, name=name, daemon=daemon)
+    t.start()
+    return t
+
+
+def _within_call(wait: float | None) -> float | None:
+    """A wait (s) shortened to end before the MCP call's deadline (llmt-runtime's requests.until: a few seconds kept
+    for the answer); outside a call (the CLI, tests, SLURM jobs) the wait as given."""
+    from llmt_runtime import requests as R
+    from llmt_runtime import slurm as S
+
+    if S.remaining() is None:
+        return wait
+    return max(0.0, R.until(1e9 if wait is None else float(wait)) - time.time())
 
 
 def _request_dir(prefix: str, name: str | None = None) -> Path:
@@ -261,12 +295,11 @@ def start(studies: dict, prefix: str = "run", extra: dict | None = None, budget_
         n = todo.pop(0)
         X.submit(folder, n, studies[n], est[n], natoms[n])
     if todo:
-        import threading
-
         def rest():
             for n in todo:
                 X.submit(folder, n, studies[n], est[n], natoms[n])
-        threading.Thread(target=rest, name="lmpt-submit", daemon=False).start()
+        # in a server through its guard (stale.GUARD.start_background): a stale exit waits for these submissions
+        background(rest, name="lmpt-submit")
     return folder
 
 
@@ -274,12 +307,13 @@ def status(request: str, wait: float = 0.0) -> dict:
     folder = Path(request).expanduser()
     if not (folder / "request.json").is_file():
         return {"error": f"no request {folder}"}
-    t_end = time.time() + max(0.0, float(wait))
+    t_end = time.time() + _within_call(max(0.0, float(wait)))
     while True:
         res = _collect(folder)
-        if res["done"] or time.time() >= t_end:
+        left = t_end - time.time()
+        if res["done"] or left <= 0:
             return res
-        time.sleep(2.0 if res.get("pending") else 1.0)
+        time.sleep(min(2.0 if res.get("pending") else 1.0, left))   # the last look comes at the wait's end
 
 
 def run(studies: dict, wait: float | None = None, request_name: str | None = None) -> dict:
@@ -300,6 +334,7 @@ def run(studies: dict, wait: float | None = None, request_name: str | None = Non
         res = status(str(found), 0.0 if wait is None else min(float(wait), 15.0))
         return dict(res, note=R.REPEAT_NOTE)
     t0 = time.time()
+    wait = _within_call(wait)          # in an MCP call: what its deadline leaves (the budget is 60 % of that)
     try:
         folder = start(studies, budget_s=30.0 if wait is None else max(1.0, 0.6 * float(wait)),
                        request_name=request_name)
@@ -307,7 +342,11 @@ def run(studies: dict, wait: float | None = None, request_name: str | None = Non
         return {"error": f"request_name {request_name!r} is being submitted by another call; call "
                          "study_status(request) in a moment", "request": str(out_root() / request_name)}
     if wait is None:
-        return status(str(folder), 1e9)
+        try:
+            return status(str(folder), 1e9)
+        except KeyboardInterrupt:      # `lmpt run` interrupted: say which SLURM jobs go on and how to stop them
+            X.print_queued_note(folder)
+            raise
     return status(str(folder), max(0.0, float(wait) - (time.time() - t0)))
 
 
@@ -443,12 +482,19 @@ def bench(names=None, request: str | None = None, wait: float | None = None, que
     if request is not None:
         return bench_status(request, wait)
     t0 = time.time()
+    wait = _within_call(wait)          # in an MCP call: what its deadline leaves (the budget is 60 % of that)
     studies, pre = B.prepare(names)
     if queue is not None:
         studies = {n: {**st, "queue": bool(queue)} for n, st in studies.items()}
     folder = start(studies, prefix="bench", extra={"bench": list(studies), "bench_pre": pre},
                    budget_s=30.0 if wait is None else max(1.0, 0.6 * float(wait)))
-    return bench_status(str(folder), None if wait is None else max(0.0, float(wait) - (time.time() - t0)))
+    if wait is None:
+        try:
+            return bench_status(str(folder), None)
+        except KeyboardInterrupt:      # `lmpt bench` interrupted: say which SLURM jobs go on and how to stop them
+            X.print_queued_note(folder)
+            raise
+    return bench_status(str(folder), max(0.0, float(wait) - (time.time() - t0)))
 
 
 def bench_status(bench: str, wait: float | None = None) -> dict:
@@ -460,7 +506,7 @@ def bench_status(bench: str, wait: float | None = None) -> dict:
     if not (folder / "request.json").is_file():
         return {"error": f"no benchmark request {folder}"}
     meta = json.loads((folder / "request.json").read_text())
-    t_end = time.time() + (1e9 if wait is None else max(0.0, float(wait)))
+    t_end = time.time() + _within_call(1e9 if wait is None else max(0.0, float(wait)))
     while True:
         res = _collect(folder)
         r = dict(meta.get("bench_pre", {}))
@@ -474,9 +520,10 @@ def bench_status(bench: str, wait: float | None = None) -> dict:
                 pending.append(n)
                 r[n] = {"pending": True, **{k: v for k, v in res.get("progress", {}).get(n, {}).items()
                                            if k in ("state", "job_id", "reason", "eta_min_max", "stage")}}
-        if not pending or time.time() >= t_end:
+        left = t_end - time.time()
+        if not pending or left <= 0:
             break
-        time.sleep(2.0)
+        time.sleep(min(2.0, left))                  # the last look comes at the wait's end
     out = _bench_out(folder, r, {k: res[k] for k in ("translator", "translator_now", "translator_note") if k in res})
     if pending:
         out["pending"] = pending

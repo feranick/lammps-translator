@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lammps-translator"
-version = "2026.11.09.3"
+version = "2026.11.09.4"
 description = "Atomistic studies (structure, potential, ordered stages) -> LAMMPS inputs and checked results; CLI, API and MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ authors = [{ name = "Nicola Ferralis", email = "ferralis@generalflash.com" }]
 license = "MIT"
 # llmt-runtime: a floor only (never an upper bound); not on PyPI: install it first from ../llmt-runtime (llm-translators
 # does), or with requirements-standalone.txt
-dependencies = ["llmt-runtime>=2026.11.09.4", "numpy>=1.24", "scipy>=1.10"]
+dependencies = ["llmt-runtime>=2026.11.09.6", "numpy>=1.24", "scipy>=1.10"]
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.2"]

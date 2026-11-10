@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with known answers (closed forms, lattice sums, published values).
-Version: 2026.11.7.1
+Version: 2026.11.09.4
 
 Default cases take seconds; 'slow' ones run only by name. 'chain_feat_cantilever' needs fea-translator
 (and CalculiX) in the same environment and is skipped otherwise.
@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import math
-import threading
 import time
 from pathlib import Path
 
@@ -240,7 +239,13 @@ def _chain_async(res: dict, folder: Path, case_dir: Path) -> dict | None:
             tmp.write_text(json.dumps(out, default=float))
             tmp.replace(f)
             _CHAIN_RUNNING.discard(key)
-        threading.Thread(target=work, name="lmpt-feat-chain", daemon=True).start()
+        # api.background: in a server through its guard (a stale exit waits for the chain), else a daemon thread
+        from . import api
+        try:
+            api.background(work, name="lmpt-feat-chain", daemon=True)
+        except BaseException:
+            _CHAIN_RUNNING.discard(key)
+            raise
     return None
 
 

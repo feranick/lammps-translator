@@ -1,5 +1,8 @@
 """MCP server behaviour: stale servers after a deploy (llm-translators docs/SHARED.md) and tools that return
-within wait_s. Version: 2026.11.7.1"""
+within wait_s. Version: 2026.11.09.4
+
+2026.11.09.4: the stale handling is llmt-runtime's server.Server (stale.GUARD); the tests set its package folder,
+state, busy() and exit instead of stale.STATE['pkg'], stale.pool_busy and stale._exit_soon."""
 import asyncio
 import json
 import os
@@ -12,6 +15,7 @@ import pytest
 
 from lammps_translator import api, stale
 from lammps_translator.lammps import find_lmp
+from lammps_translator.stale import GUARD
 
 ROOT = Path(__file__).parent.parent
 OLD, NEW = "2001.01.01.1", "2001.01.01.2"          # fake release names (not this package's version)
@@ -41,12 +45,15 @@ PKG = f"releases/{OLD}/lammps-translator/lammps_translator"
 
 @pytest.fixture
 def clean_stale(monkeypatch):
-    saved = dict(stale.STATE)
+    # retargeted in 2026.11.09.4: stale.STATE is GUARD.state; the exit is GUARD.exit_soon (was stale._exit_soon); the
+    # package folder is GUARD.pkg_dir (was STATE['pkg']), restored after the test
+    saved = dict(GUARD.state)
     exits = []
-    monkeypatch.setattr(stale, "_exit_soon", lambda why, delay: exits.append(why))
+    monkeypatch.setattr(GUARD, "exit_soon", lambda why, delay: exits.append(why))
+    monkeypatch.setattr(GUARD, "pkg_dir", GUARD.pkg_dir)
     yield exits
-    stale.STATE.clear()
-    stale.STATE.update(saved)
+    GUARD.state.clear()
+    GUARD.state.update(saved)
 
 
 def test_stale_reason_shared_and_checkout(tmp_path):
@@ -66,15 +73,17 @@ def test_stale_reason_shared_and_checkout(tmp_path):
 
 def test_only_a_serving_stale_server_refuses(tmp_path, clean_stale, monkeypatch):
     prefix = _releases(tmp_path)
-    stale.STATE.update(pkg=prefix / PKG, checked=0.0, serving=False, inflight=0, exiting=False)
+    GUARD.pkg_dir = prefix / PKG                       # (was STATE['pkg'])
+    stale.STATE.update(checked=0.0, serving=False, inflight=0, background=0, exiting=False)
     _switch(prefix, NEW)
     assert stale.enter_call() is None                  # tests / run-study: not serving, served normally
     stale.leave_call()
     stale.STATE.update(serving=True, checked=0.0)
-    monkeypatch.setattr(stale, "pool_busy", lambda: True)            # a local study runs: answer, with a note
+    # GUARD.busy (was stale.pool_busy: the guard holds the function it was given)
+    monkeypatch.setattr(GUARD, "busy", lambda: True)                 # a local study runs: answer, with a note
     assert stale.enter_call() is None and "old code" in stale.note()
     stale.leave_call()
-    monkeypatch.setattr(stale, "pool_busy", lambda: False)
+    monkeypatch.setattr(GUARD, "busy", lambda: False)
     msg = stale.enter_call()
     assert msg and msg.startswith("STALE_SERVER") and clean_stale
     monkeypatch.setenv("LMPT_EXIT_WHEN_STALE", "0")                   # never
@@ -83,10 +92,12 @@ def test_only_a_serving_stale_server_refuses(tmp_path, clean_stale, monkeypatch)
     stale.leave_call()
 
 
-def test_stale_refusal_reaches_the_caller_as_tool_error(tmp_path, clean_stale):
+def test_stale_refusal_reaches_the_caller_as_tool_error(tmp_path, clean_stale, monkeypatch):
     from lammps_translator import mcp_server as m
     prefix = _releases(tmp_path)
-    stale.STATE.update(pkg=prefix / PKG, checked=0.0, serving=True, inflight=0, exiting=False)
+    GUARD.pkg_dir = prefix / PKG                       # (was STATE['pkg'])
+    monkeypatch.setattr(GUARD, "busy", lambda: False)  # idle whatever other tests left in the pool
+    stale.STATE.update(checked=0.0, serving=True, inflight=0, background=0, exiting=False)
     _switch(prefix, NEW)
     with pytest.raises(m.ToolError, match="STALE_SERVER"):
         asyncio.run(m.jobs())
@@ -94,8 +105,9 @@ def test_stale_refusal_reaches_the_caller_as_tool_error(tmp_path, clean_stale):
 
 def test_idle_stale_server_exits_by_itself(tmp_path):
     prefix = _releases(tmp_path)
-    code = (f"import time; from lammps_translator import stale; stale.serve({str(prefix / PKG)!r}, period=0.3); "
-            "print('watching', flush=True); time.sleep(60)")
+    # stale.serve now calls GUARD.serve: no server log (it would go to ~/lmpt_runs/.server) and no signal handlers here
+    code = (f"import time; from lammps_translator import stale; stale.serve({str(prefix / PKG)!r}, period=0.3, "
+            "log=False, signals=False); print('watching', flush=True); time.sleep(60)")
     env = dict(os.environ, PYTHONPATH=str(ROOT))
     p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                          env=env)

@@ -1,5 +1,8 @@
 """executor.py — where studies run: the local worker pool or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.09.3
+Version: 2026.11.09.4
+
+2026.11.09.4: queued_note / print_queued_note, what `lmpt run` and `lmpt bench` say when interrupted while waiting for
+SLURM jobs (the job ids still queued and how to cancel them; nothing is cancelled).
 
 From 2026.11.09.3 the SLURM layer is llmt-runtime's (llmt_runtime.slurm and llmt_runtime.jobs, configured by
 runtime.RT): the settings (LMPT_EXECUTOR, LMPT_SLURM_ARGS split by RT.slurm.slurm_args, LMPT_SLURM_MEM, LMPT_SLURM_NODE,
@@ -751,6 +754,48 @@ def cancel(request: Path, names: list[str]) -> dict:
         for n, j in ids.items():
             out[n] = {"cancelled": err is None, "job_id": j, **({} if err is None else {"why": err})}
     return out
+
+
+def queued_note(request: Path) -> str | None:
+    """What to tell someone who interrupted a command that was waiting for a request's SLURM jobs (`lmpt run`,
+    `lmpt bench`): the jobs still in the queue and how to stop them. They are not cancelled: they run without the
+    command, and their results are collected later. None when no job of the request is left in the queue. (As
+    cfd-translator's executor.queued_note, 2026.11.09.4.)"""
+    request = Path(request)
+    try:
+        names = json.loads((request / "request.json").read_text()).get("names", [])
+    except (OSError, ValueError):
+        names = [p.name for p in request.iterdir() if (p / "job.json").is_file()] if request.is_dir() else []
+    ids = []
+    for n in names:
+        if not (request / n / f"{n}.json").is_file():
+            jid = J.read_job(request / n).get("job_id")
+            if jid:
+                ids.append(str(jid))
+    if not ids:
+        return None
+    q = J.squeue(ids)
+    if q is not None:                       # SLURM did not answer: name them all
+        ids = [i for i in ids if i in q and (q[i]["state"] in J.QUEUED or q[i]["state"] in J.ACTIVE)]
+    if not ids:
+        return None
+    many = len(ids) > 1
+    return (f"interrupted: SLURM job{'s' if many else ''} {', '.join(ids)} of {request} {'are' if many else 'is'} "
+            f"still in the queue and will run without this command (nothing was cancelled). `{CLI} jobs` shows "
+            f"them; collect the results later with study_status(request) (bench_status for benchmarks) from the MCP "
+            f"tools; to stop {'them' if many else 'it'}: "
+            f"`{CLI} cancel {request}` (cancel(request) from the MCP tools) or `scancel {' '.join(ids)}`")
+
+
+def print_queued_note(request: Path) -> None:
+    """queued_note on stderr (stdout keeps the command's output); never raises."""
+    import sys
+    try:
+        note = queued_note(request)
+    except Exception:  # noqa: BLE001
+        note = None
+    if note:
+        print(f"[{CLI}] {note}", file=sys.stderr, flush=True)
 
 
 def machine() -> dict | None:

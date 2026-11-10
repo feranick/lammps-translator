@@ -1,5 +1,5 @@
 """runtime.py — lmpt's llmt-runtime: the executor code the translators share, with lmpt's settings and hooks.
-Version: 2026.11.09.3
+Version: 2026.11.09.4
 
     RT                 llmt_runtime.Runtime for lmpt (LMPT_ settings, the `lmpt` CLI, MPI: --ntasks)
     RUNTIME_VERSION    llmt-runtime's version (tool_status().executor.runtime)
@@ -13,7 +13,8 @@ node's cores), the memory (executor.mem_auto: 1 GB + 256 MB per rank + 4 kB per 
 estimate_min and procs_requested (executor.job_extra), the progress of running jobs (api.progress), the out-of-memory
 advice and the timeout hint. The job's resource lines are the runtime's MPI lines without --nodes=1 (--ntasks=N,
 --ntasks-per-core=1 unless LMPT_SLURM_ARGS places the ranks), as lmpt wrote them; cancel()'s flag file keeps lmpt's
-name, cancelled.json. The MCP server's stale handling (stale.py) stays until phase 3.
+name, cancelled.json. Phase 3 (2026.11.09.4): the MCP server's common code is llmt-runtime's server.Server, configured
+with RT in stale.py (GUARD: stale servers, the tool wrapper with its 48 s deadline, the server's log, signals).
 
 The hooks are small wrappers that import executor and api when called: executor imports RT from here.
 """
