@@ -340,6 +340,9 @@ def test_tool_errors_keep_their_text_and_calls_have_a_deadline(monkeypatch):
     from llmt_runtime import server as LS
     g, _ = _guard(monkeypatch)
     monkeypatch.setattr(g, "busy", lambda: False)
+    # not stale whatever the install: run in a release that is not current yet (llmt deploy --no-switch, then its
+    # tests), the real check finds it stale and adds server_stale (carbonio, 2026.11.09.4)
+    monkeypatch.setattr(g, "stale", lambda: None)
     assert m.GUARD is g
     monkeypatch.setattr(api, "jobs", lambda limit=20, active=False: {"left": S.remaining()})
     r = asyncio.run(m.jobs())
