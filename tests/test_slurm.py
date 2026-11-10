@@ -1,4 +1,6 @@
-"""SLURM executor tests with fake sbatch/squeue/scancel/sacct/sinfo (tests/fakeslurm.py). Version: 2026.11.7.1
+"""SLURM executor tests with llmt-runtime's fake sbatch/squeue/scancel/sacct/sinfo/scontrol
+(llmt_runtime.testing.fake_slurm; lmpt's own tests/fakeslurm.py until 2026.11.09.2, its file knobs now the merged
+fake's FAKE_* variables and job records). Version: 2026.11.09.3
 They run anywhere; with LAMMPS (set LMPT_LMP, or lmp on the PATH) the jobs also compute real results."""
 import json
 import os
@@ -8,6 +10,9 @@ import time
 from pathlib import Path
 
 import pytest
+
+from llmt_runtime import slurm as S
+from llmt_runtime.testing import calls, fake_slurm
 
 from lammps_translator import api
 from lammps_translator import executor as X
@@ -19,23 +24,20 @@ HAVE_LAMMPS = find_lmp() is not None
 LJ = {"system": {"lattice": "fcc", "a": 5.3, "elements": ["Ar"], "size": [3, 3, 3]},
       "potential": {"style": "lj", "eps": 0.0104, "sigma": 3.405, "cutoff": 8.5, "shift": True},
       "stages": [{"kind": "energy"}]}
+FAKE_KNOBS = ("FAKE_SBATCH_FAIL", "FAKE_SBATCH_PENDING", "FAKE_PENDING", "FAKE_SBATCH_DELAY", "FAKE_SBATCH_SLEEP",
+              "FAKE_SBATCH_SLOW_AFTER", "FAKE_MIN_JOB_AGE", "FAKE_PRIORITY", "FAKE_RUN_NODE", "FAKE_START",
+              "FAKE_SACCT_FAIL", "FAKE_SQUEUE_FAIL", "FAKE_SCONTROL_NODES", "FAKE_SCONTROL_FAIL", "FAKE_SCONTROL_DENY",
+              "FAKE_SINFO_FAIL", "FAKE_SINFO_PARTITIONS", "FAKE_SINFO_CPUS", "FAKE_TIME_LEFT")
 
 
 @pytest.fixture
 def slurm(tmp_path, monkeypatch):
-    fake = tmp_path / "fake"
-    fake.mkdir()
-    bin_ = tmp_path / "bin"
-    bin_.mkdir()
-    for c in ("sbatch", "squeue", "scancel", "sacct", "sinfo", "scontrol"):
-        w = bin_ / c
-        w.write_text(f"#!/bin/sh\nexec {sys.executable} {HERE / 'fakeslurm.py'} {c} \"$@\"\n")
-        w.chmod(0o755)
+    """llmt-runtime's fake SLURM (one node fake1: 40 CPUs, 20 cores, 64000 MB); returns its state folder."""
+    for k in FAKE_KNOBS:
+        monkeypatch.delenv(k, raising=False)
     lmp = find_lmp()
-    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
     if lmp:
         monkeypatch.setenv("LMPT_LMP", " ".join(lmp))
-    monkeypatch.setenv("FAKE_SLURM", str(fake))
     monkeypatch.setenv("LMPT_EXECUTOR", "slurm")
     monkeypatch.setenv("LMPT_SLURM_MIN_MINUTES", "0")
     monkeypatch.setenv("LMPT_OUT", str(tmp_path / "runs"))
@@ -44,13 +46,27 @@ def slurm(tmp_path, monkeypatch):
     monkeypatch.setenv("LMPT_ATOMS_PER_RANK", "1")      # no size cap unless a test sets one
     for k in ("LMPT_MAX_TIMEOUT", "LMPT_MAX_MEM", "LMPT_MAX_PROCS", "LMPT_SLURM_ARGS", "LMPT_SLURM_MEM", "LMPT_PROCS"):
         monkeypatch.delenv(k, raising=False)
+    state_dir = fake_slurm(tmp_path, monkeypatch)
     X.forget_nodes()
-    yield fake
+    yield state_dir
     X.forget_nodes()
 
 
-def _state(fake):
-    return json.loads((fake / "state.json").read_text())
+def _hold(monkeypatch):
+    """Jobs stay PENDING (the former $FAKE_SLURM/hold file)."""
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+
+
+def _jobs(state_dir):
+    """The fake's job records {id: record} (the former state.json's jobs)."""
+    return {f.stem: json.loads(f.read_text()) for f in sorted((state_dir / "jobs").glob("*.json"))}
+
+
+def _set(state_dir, jid, **kw):
+    """Changes a fake job's record (vanished, sacct, final, state, ...). (state_dir: the fake's folder; a record's
+    own 'state' is one of the keywords.)"""
+    f = state_dir / "jobs" / f"{jid}.json"
+    f.write_text(json.dumps({**json.loads(f.read_text()), **kw}))
 
 
 def _new_process_status(request, wait=90):
@@ -63,7 +79,7 @@ def _new_process_status(request, wait=90):
 def test_status_key_and_job_file(slurm, monkeypatch):
     s = api.tool_status()["executor"]
     assert s["kind"] == "slurm" and s["sbatch"].endswith("sbatch") and s["time_limit_min"] == 370   # 6 h + 10 min
-    (slurm / "hold").write_text("")
+    _hold(monkeypatch)
     monkeypatch.setenv("LMPT_PROCS", "3")
     r = api.run({"lj": LJ}, wait=0)
     req = Path(r["request"])
@@ -74,7 +90,8 @@ def test_status_key_and_job_file(slurm, monkeypatch):
     info = json.loads((req / "lj" / "job.json").read_text())
     assert info["executor"] == "slurm" and info["procs"] == 3 and info["time_min"] == 370
     assert r["pending"] == ["lj"] and r["progress"]["lj"]["state"] == "queued"
-    assert r["progress"]["lj"]["reason"] == "Resources" and r["progress"]["lj"]["ahead"] == 0
+    # the reason squeue gives: llmt-runtime's fake says 'Priority' for a held job (lmpt's own fake said 'Resources')
+    assert r["progress"]["lj"]["reason"] == "Priority" and r["progress"]["lj"]["ahead"] == 0
     assert "SLURM jobs" in r["next"] and info["job_id"] in r["next"]
 
 
@@ -109,19 +126,20 @@ def test_short_studies_stay_local(slurm, monkeypatch):
     api.status(str(folder), 60)
 
 
-def test_submit_failure_is_a_result(slurm):
-    (slurm / "fail_submit").write_text("")
+def test_submit_failure_is_a_result(slurm, monkeypatch):
+    monkeypatch.setenv("FAKE_SBATCH_FAIL", "1")
     r = api.run({"lj": LJ}, wait=0)
     res = r["studies"]["lj"]
     assert r["done"] and res["ok"] is False and res["why"].startswith("could not submit:")
     assert "slurm controller" in res["why"]
 
 
-def test_cancel_queued(slurm):
-    (slurm / "hold").write_text("")
+def test_cancel_queued(slurm, monkeypatch):
+    _hold(monkeypatch)
     r = api.run({"a": LJ, "b": LJ}, wait=0)
     c = api.cancel(r["request"], ["a"])
     assert c["cancel"]["a"]["cancelled"]
+    assert json.loads((Path(r["request"]) / "a" / "cancelled.json").read_text())["by"] == "cancel()"
     st = c["status"]
     assert st["studies"]["a"]["state"] == "cancelled" and st["studies"]["a"]["ok"] is False
     assert st["pending"] == ["b"]
@@ -134,17 +152,15 @@ def test_cancel_queued(slurm):
     (None, "slurmstepd: error: *** JOB 1001 ON x CANCELLED AT 2026 ***", "cancelled"),
     (None, "Segmentation fault", "failed"),
 ])
-def test_failure_states(slurm, sacct, log, state):
-    (slurm / "hold").write_text("")
+def test_failure_states(slurm, monkeypatch, sacct, log, state):
+    _hold(monkeypatch)
     r = api.run({"lj": LJ}, wait=0)
     jid = json.loads((Path(r["request"]) / "lj" / "job.json").read_text())["job_id"]
-    s = _state(slurm)
-    s["jobs"][jid]["vanished"] = True          # gone from the queue, no result
-    (slurm / "state.json").write_text(json.dumps(s))
+    _set(slurm, jid, vanished=True)            # gone from the queue, no result
     if sacct:
-        (slurm / f"sacct_{jid}").write_text(sacct)
+        _set(slurm, jid, sacct=sacct)
     else:
-        (slurm / "sacct_fail").write_text("")
+        monkeypatch.setenv("FAKE_SACCT_FAIL", "1")
     (Path(r["request"]) / "lj" / "job.log").write_text(log + "\n")
     out = api.status(r["request"])
     res = out["studies"]["lj"]
@@ -159,20 +175,20 @@ def test_failure_states(slurm, sacct, log, state):
         assert "--mem" in res["why"]
 
 
-def test_jobs_lists_requests_queue_and_machine(slurm):
-    (slurm / "hold").write_text("")
+def test_jobs_lists_requests_queue_and_machine(slurm, monkeypatch):
+    _hold(monkeypatch)
     r1 = api.run({"x": LJ}, wait=0)
     j = api.jobs()
     assert j["requests"][0]["request"] == r1["request"] and j["requests"][0]["studies"]["x"]["state"] == "queued"
     assert j["queue"] == {"running": 0, "queued": 1, "cpus_in_use": 0}
-    assert j["machine"]["cpus"] == 8
+    assert j["machine"]["cpus"] == 8            # the fake's sinfo, now per node (sinfo -N, each node once)
     api.cancel(r1["request"])
     assert api.jobs(active=True)["requests"] == []
     assert api.jobs()["requests"][0]["studies"]["x"]["state"] == "cancelled"
 
 
-def test_run_study_cli_by_hand(slurm, tmp_path):
-    (slurm / "hold").write_text("")
+def test_run_study_cli_by_hand(slurm, tmp_path, monkeypatch):
+    _hold(monkeypatch)
     r = api.run({"lj": LJ}, wait=0)
     p = subprocess.run([sys.executable, "-m", "lammps_translator.cli", "run-study", r["request"], "lj"],
                        capture_output=True, text=True, timeout=120, env=os.environ)
@@ -242,15 +258,15 @@ def test_bench_queue_flag_overrides_min_minutes(slurm, monkeypatch):
     assert out["passed"] == ["madelung_nacl"] and out["cases"]["madelung_nacl"]["job_id"]
 
 
-def test_ahead_follows_priority_then_job_id(slurm):
-    (slurm / "hold").write_text("")
+def test_ahead_follows_priority_then_job_id(slurm, monkeypatch):
+    _hold(monkeypatch)
     r = api.run({"a": LJ, "b": LJ, "c": LJ}, wait=0)
     ahead = {n: r["progress"][n]["ahead"] for n in "abc"}
     assert ahead == {"a": 0, "b": 1, "c": 2}, ahead
 
 
 def test_job_limits_time_estimate_and_memory(slurm, monkeypatch):
-    (slurm / "hold").write_text("")
+    _hold(monkeypatch)
     monkeypatch.setenv("LMPT_PROCS", "3")
     r = api.run({"lj": LJ}, wait=0)
     d = Path(r["request"]) / "lj"
@@ -284,8 +300,8 @@ def test_job_limits_time_estimate_and_memory(slurm, monkeypatch):
 
 
 @pytest.mark.skipif(not HAVE_LAMMPS, reason="needs LAMMPS")
-def test_estimate_limit_timeout_says_what_to_change(slurm):
-    (slurm / "hold").write_text("")
+def test_estimate_limit_timeout_says_what_to_change(slurm, monkeypatch):
+    _hold(monkeypatch)
     st = {**LJ, "stages": [{"kind": "nvt", "T": 30, "steps": 50_000_000}]}
     r = api.run({"md": st}, wait=0)
     d = Path(r["request"]) / "md"
@@ -304,7 +320,7 @@ RUNSET = {"timeout_s": 30000, "mem": "12G", "procs": 4, "queue": True}
 
 
 def test_run_settings_override_defaults_for_that_study(slurm, monkeypatch):
-    (slurm / "hold").write_text("")
+    _hold(monkeypatch)
     monkeypatch.setenv("LMPT_PROCS", "2")
     monkeypatch.setenv("LMPT_SLURM_ARGS", "--mem=8G --nice=100")
     r = api.run({"custom": {**LJ, "run": RUNSET}, "plain": {**LJ, "queue": True}}, wait=0)
@@ -347,7 +363,7 @@ def test_run_settings_validation(slurm, monkeypatch, study, word):
 
 
 def test_size_cap_on_ranks(slurm, monkeypatch):
-    (slurm / "hold").write_text("")
+    _hold(monkeypatch)
     monkeypatch.setenv("LMPT_ATOMS_PER_RANK", "50")
     r = api.run({"lj": {**LJ, "run": {"procs": 8}}}, wait=0)            # 108 atoms: 3 ranks
     d = Path(r["request"]) / "lj"
@@ -356,8 +372,8 @@ def test_size_cap_on_ranks(slurm, monkeypatch):
     assert info["procs"] == 3 and info["procs_requested"] == 8
 
 
-def test_run_by_hand_records_limits(slurm, tmp_path):
-    (slurm / "hold").write_text("")
+def test_run_by_hand_records_limits(slurm, tmp_path, monkeypatch):
+    _hold(monkeypatch)
     r = api.run({"lj": LJ}, wait=0)
     env = {k: v for k, v in os.environ.items() if not k.startswith("SLURM_")}
     p = subprocess.run([sys.executable, "-m", "lammps_translator.cli", "run-study", r["request"], "lj"],
@@ -369,7 +385,7 @@ def test_run_by_hand_records_limits(slurm, tmp_path):
 
 def test_validation_estimates_match_the_job(slurm, monkeypatch):
     from lammps_translator.format import validate
-    (slurm / "hold").write_text("")
+    _hold(monkeypatch)
     monkeypatch.setenv("LMPT_ATOMS_PER_RANK", "50")
     monkeypatch.setenv("LMPT_PROCS", "8")
     md = {**LJ, "stages": [{"kind": "nvt", "T": 30, "steps": 100000}]}
@@ -395,15 +411,27 @@ SPARKS = [{"name": "spark-5da5", "hostname": "spark-5da5", "addr": "100.77.175.9
           {"name": "spark-0808", "hostname": "spark-0808", "addr": "100.76.107.42", "cpus": 8, "tpc": 2}]
 
 
-def _two_nodes(slurm, monkeypatch, me_addr="100.76.107.42"):
-    (slurm / "nodes.json").write_text(json.dumps(SPARKS))
-    monkeypatch.setattr(X, "_my_addresses", lambda: {"127.0.0.1", me_addr})
-    monkeypatch.setattr(X, "_hostname", lambda: "lmpt-test-host")     # matches neither, even on a Spark
+def _nodes(state_dir, monkeypatch, nodes, me_addr="", host="lmpt-test-host"):
+    """The nodes as `scontrol -o show node` lines for llmt-runtime's fake (FAKE_SCONTROL_NODES; lmpt's fake read
+    nodes.json), this machine's addresses and host name as llmt-runtime's this_node sees them; then the cluster is asked
+    again."""
+    lines = [f"NodeName={n['name']} Arch=x86_64 CoresPerSocket={n['cpus'] // n['tpc']} CPUAlloc=0 CPUTot={n['cpus']} "
+             f"NodeAddr={n['addr']} NodeHostName={n['hostname']} RealMemory={n.get('mem', 64000)} Sockets=1 Boards=1 "
+             f"State=IDLE ThreadsPerCore={n['tpc']}" for n in nodes]
+    f = state_dir / "nodes.txt"
+    f.write_text("\n".join(lines) + "\n")
+    monkeypatch.setenv("FAKE_SCONTROL_NODES", str(f))
+    monkeypatch.setattr(S, "addresses", lambda: {"127.0.0.1", me_addr} - {""})
+    monkeypatch.setattr(S.socket, "gethostname", lambda: host)          # matches no node, even on a Spark
     X.forget_nodes()
 
 
+def _two_nodes(state_dir, monkeypatch, me_addr="100.76.107.42"):
+    _nodes(state_dir, monkeypatch, SPARKS, me_addr)
+
+
 def test_node_local_pins_jobs_to_this_node(slurm, monkeypatch):
-    (slurm / "hold").write_text("")
+    _hold(monkeypatch)
     _two_nodes(slurm, monkeypatch)
     n = X.status()["node"]
     assert n == {"setting": "local", "nodelist": "spark-0808", "cluster_nodes": 2, "this_node": "spark-0808",
@@ -419,7 +447,7 @@ def test_node_local_pins_jobs_to_this_node(slurm, monkeypatch):
 
 
 def test_node_any_list_and_args(slurm, monkeypatch):
-    (slurm / "hold").write_text("")
+    _hold(monkeypatch)
     _two_nodes(slurm, monkeypatch)
     monkeypatch.setenv("LMPT_SLURM_NODE", "any")
     assert X.status()["node"]["nodelist"] is None
@@ -440,7 +468,7 @@ def test_node_any_list_and_args(slurm, monkeypatch):
 
 
 def test_single_node_cluster_and_unknown_node(slurm, monkeypatch):
-    (slurm / "hold").write_text("")
+    _hold(monkeypatch)
     assert X.status()["node"]["nodelist"] is None and X.status()["node"]["cluster_nodes"] == 1   # default fake
     r = api.run({"lj": LJ}, wait=0)
     assert "--nodelist" not in (Path(r["request"]) / "lj" / "job.sh").read_text()
@@ -450,7 +478,7 @@ def test_single_node_cluster_and_unknown_node(slurm, monkeypatch):
 
 
 def test_two_options_in_slurm_args(slurm, monkeypatch):
-    (slurm / "hold").write_text("")
+    _hold(monkeypatch)
     _two_nodes(slurm, monkeypatch)
     monkeypatch.setenv("LMPT_SLURM_ARGS", "--mem=8G --nodelist=spark-5da5")
     monkeypatch.setenv("LMPT_SLURM_MEM", "4G")                                # the args' --mem wins
@@ -469,14 +497,14 @@ def test_two_options_in_slurm_args(slurm, monkeypatch):
 
 
 def test_failed_scontrol_is_asked_again(slurm, monkeypatch):
-    (slurm / "scontrol_fail").write_text("")
+    monkeypatch.setenv("FAKE_SCONTROL_FAIL", "1")
     assert X.cluster_nodes() is None and X.status()["node"]["cluster_nodes"] is None
-    (slurm / "scontrol_fail").unlink()
-    X._NODES_CACHE["failed"] -= 10                                             # the next call, seconds later
+    monkeypatch.delenv("FAKE_SCONTROL_FAIL")
+    S._NODES["failed"] -= 10                     # the next call, seconds later (llmt-runtime keeps the cluster now)
     assert X.cluster_nodes() is not None                                       # the controller is back
-    calls = int((slurm / "scontrol_calls").read_text())
+    n = calls(slurm, "scontrol")
     X.cluster_nodes()
-    assert int((slurm / "scontrol_calls").read_text()) == calls                # a success is kept (60 s)
+    assert calls(slurm, "scontrol") == n                                       # a success is kept (60 s)
 
 
 def test_failed_lmp_info_is_asked_again(tmp_path, monkeypatch):
@@ -496,10 +524,8 @@ def test_failed_lmp_info_is_asked_again(tmp_path, monkeypatch):
 # ------------------------------------------------------------------- the most memory a job can have
 def test_node_memory_caps_run_mem(slurm, monkeypatch):
     from lammps_translator.format import validate_study
-    (slurm / "nodes.json").write_text(json.dumps([{**SPARKS[0], "mem": 62926}, {**SPARKS[1], "mem": 120000}]))
-    monkeypatch.setattr(X, "_my_addresses", lambda: {"100.77.175.91"})        # this is spark-5da5
-    monkeypatch.setattr(X, "_hostname", lambda: "lmpt-test-host")
-    X.forget_nodes()
+    _nodes(slurm, monkeypatch, [{**SPARKS[0], "mem": 62926}, {**SPARKS[1], "mem": 120000}],
+           me_addr="100.77.175.91")                                            # this is spark-5da5
     c = X.caps()
     assert c["mem"] == "62926M" and c["mem_mb"] == 62926 and "RealMemory" in c["mem_from"]   # this node, not 120 GB
     v = validate_study({**LJ, "run": {"mem": "90G"}})
@@ -518,23 +544,21 @@ def test_node_memory_caps_run_mem(slurm, monkeypatch):
 
 
 def test_no_node_memory_without_slurm_or_when_unknown(slurm, monkeypatch):
-    (slurm / "nodes.json").write_text(json.dumps([{"name": "n1", "hostname": "n1", "addr": "", "cpus": 8, "tpc": 1,
-                                                   "mem": 1}]))           # SLURM does not know it
-    monkeypatch.setattr(X, "_hostname", lambda: "n1")
-    X.forget_nodes()
+    _nodes(slurm, monkeypatch, [{"name": "n1", "hostname": "n1", "addr": "", "cpus": 8, "tpc": 1, "mem": 1}],
+           host="n1")                                                         # SLURM does not know its memory
     assert "mem_mb" not in X.caps() and X.caps()["mem"] is None
     monkeypatch.setenv("LMPT_EXECUTOR", "local")
     monkeypatch.setenv("LMPT_MAX_MEM", "8G")
     assert X.caps()["mem_mb"] == 8192 and X.caps()["mem_from"] == "LMPT_MAX_MEM"
 
 
-def test_request_name_submits_once(slurm):
-    (slurm / "hold").write_text("")
+def test_request_name_submits_once(slurm, monkeypatch):
+    _hold(monkeypatch)
     r = api.run({"lj": LJ}, wait=0, request_name="run_20261107_120000_abc123")
     assert r["request"].endswith("/run_20261107_120000_abc123") and r["pending"] == ["lj"]
     again = api.run({"lj": LJ}, wait=0, request_name="run_20261107_120000_abc123")
     assert "submitted before" in again["note"] and again["pending"] == ["lj"]
-    assert len(_state(slurm)["jobs"]) == 1                                     # sbatch ran once
+    assert len(_jobs(slurm)) == 1                                              # sbatch ran once
     assert "error" in api.run({"lj": LJ}, wait=0, request_name="../etc")
     assert "error" in api.run({"lj": LJ}, wait=0, request_name="bench_1")
     (Path(r["request"]).parent / "run_half").mkdir()

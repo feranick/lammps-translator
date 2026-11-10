@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.09.1
+Version: 2026.11.09.3
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks (builds the structures, finds potential files; no LAMMPS run)
@@ -16,8 +16,9 @@ Version: 2026.11.09.1
     cancel(request, names)           stops a request's studies (scancel; locally only those this process runs)
 
 Studies run in worker processes with a time limit each, or (LMPT_EXECUTOR=slurm) as one SLURM job per study
-(executor.py). Environment: LMPT_OUT (default ~/lmpt_runs), LMPT_WORKERS (2), LMPT_TIMEOUT (seconds per study,
-21600), LMPT_LMP (LAMMPS command), LMPT_PROCS (MPI ranks, 1), LMPT_MPIRUN (mpirun), LMPT_POTENTIALS (extra
+(executor.py: llmt-runtime's SLURM layer from 2026.11.09.3; jobs and cancel keep their shapes, built from its states,
+queue position, sacct, scancel and machine CPUs; run_studies keeps its budgeted submission). Environment: LMPT_OUT
+(default ~/lmpt_runs), LMPT_WORKERS (2), LMPT_TIMEOUT (seconds per study, 21600), LMPT_LMP (LAMMPS command), LMPT_PROCS (MPI ranks, 1), LMPT_MPIRUN (mpirun), LMPT_POTENTIALS (extra
 potential folders, ':'-separated), LMPT_EXECUTOR, LMPT_SLURM_MIN_MINUTES (1), LMPT_SLURM_ARGS.
 """
 from __future__ import annotations
@@ -312,17 +313,17 @@ def run(studies: dict, wait: float | None = None, request_name: str | None = Non
 
 def run_one(request: str, name: str) -> int:
     """The SLURM job's command (lmpt run-study): runs one study of a request as a pool worker would."""
+    from llmt_runtime import jobs as J
+
     from .runner import run_study
 
     folder = Path(request).expanduser()
     meta = json.loads((folder / "request.json").read_text())
     study = meta["studies"][name]
     procs = int(os.environ.get("SLURM_NTASKS") or 0) or X.procs_of(study)
-    try:
-        job = json.loads((folder / name / "job.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        job = {}
-    timeout = float(job.get("timeout_s") or X.timeout_s(study))
+    job = J.read_job(folder / name)
+    # the study's own timeout as its job was sized (job.json timeout_s: shorter with LMPT_SLURM_TIME=estimate)
+    timeout = J.job_timeout_s(folder / name, X.timeout_s(study))
     res = run_study(name, study, folder / name, timeout, procs,
                     executor="slurm" if os.environ.get("SLURM_JOB_ID") else "by hand")
     if not res.get("ok") and "timed out" in str(res.get("why", "")):
@@ -343,12 +344,22 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
             if d.is_dir() and (d / "request.json").is_file() and any(d.glob("*/job.json")):
                 reqs.append(d)
     reqs.sort(key=lambda d: (d / "request.json").stat().st_mtime, reverse=True)
+    from llmt_runtime import slurm as S
+
     q = X.queue()
     out = []
     for d in reqs:
         try:
             meta = json.loads((d / "request.json").read_text())
         except (OSError, json.JSONDecodeError):
+            continue
+        left = S.remaining()            # within an MCP call's deadline (llmt-runtime's), a request not checked says so
+        if left is not None and left < 5:
+            out.append({"request": str(d), "started": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                                   time.localtime(meta.get("started", 0))),
+                        "note": "not checked: SLURM was slow and the call ran out of time; ask again"})
+            if len(out) >= limit:
+                break
             continue
         sts = {}
         for n in meta.get("names", []):
