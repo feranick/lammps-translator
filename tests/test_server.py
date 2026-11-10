@@ -1,5 +1,5 @@
 """MCP server behaviour: stale servers after a deploy (llm-translators docs/SHARED.md) and tools that return
-within wait_s. Version: 2026.11.09.4
+within wait_s. Version: 2026.11.09.6
 
 2026.11.09.4: the stale handling is llmt-runtime's server.Server (stale.GUARD); the tests set its package folder,
 state, busy() and exit instead of stale.STATE['pkg'], stale.pool_busy and stale._exit_soon."""
@@ -108,7 +108,7 @@ def test_idle_stale_server_exits_by_itself(tmp_path):
     # stale.serve now calls GUARD.serve: no server log (it would go to ~/lmpt_runs/.server) and no signal handlers here
     code = (f"import time; from lammps_translator import stale; stale.serve({str(prefix / PKG)!r}, period=0.3, "
             "log=False, signals=False); print('watching', flush=True); time.sleep(60)")
-    env = dict(os.environ, PYTHONPATH=str(ROOT))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(ROOT), os.environ.get("PYTHONPATH")])))
     p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                          env=env)
     assert p.stdout.readline().strip() == "watching"
@@ -160,7 +160,7 @@ def test_orphaned_worker_ends_with_its_lammps_runs(tmp_path):
              "workers.PARENT_POLL_S = 0.2; workers.watch_parent(); "
              f"open({str(out)!r}, 'w').write(f'{{os.getpid()}} {{p.pid}}'); time.sleep(120)")
     parent = (f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(120)")
-    env = dict(os.environ, PYTHONPATH=str(ROOT))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(ROOT), os.environ.get("PYTHONPATH")])))
     srv = subprocess.Popen([sys.executable, "-c", parent], env=env)
     t0 = time.time()
     while not (out.is_file() and out.read_text().strip()):
