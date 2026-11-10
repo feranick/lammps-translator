@@ -151,7 +151,8 @@ def test_failure_states(slurm, sacct, log, state):
     assert out["done"] and res["state"] == state and res["ok"] is False and res["why"], res
     assert res["execution"] == {"executor": "slurm", "slurm_job": jid}
     if state == "failed":
-        assert "log_tail" in res or "SLURM state" in res["why"]
+        # the end of job.log, or SLURM's state ('(SLURM: NODE_FAIL)': llmt-runtime's wording from 2026.11.09.1)
+        assert "log_tail" in res or "SLURM state" in res["why"] or f"(SLURM: {sacct})" in res["why"]
     if state == "timed_out":
         assert "LMPT_TIMEOUT" in res["why"]
     if state == "out_of_memory":
