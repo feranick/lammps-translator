@@ -1,6 +1,6 @@
 """SLURM executor tests with llmt-runtime's fake sbatch/squeue/scancel/sacct/sinfo/scontrol
 (llmt_runtime.testing.fake_slurm; lmpt's own tests/fakeslurm.py until 2026.11.09.2, its file knobs now the merged
-fake's FAKE_* variables and job records). Version: 2026.11.18.1
+fake's FAKE_* variables and job records). Version: 2026.11.18.2
 They run anywhere; with LAMMPS (set LMPT_LMP, or lmp on the PATH) the jobs also compute real results."""
 import json
 import os
@@ -608,3 +608,24 @@ def test_run_after_job_is_waiting(slurm, monkeypatch):
     assert st["state"] == "waiting" and st["reason"].startswith(f"after {first}/a"), st
     jb = json.loads((Path(r2["request"]) / "b" / "job.json").read_text())["job_id"]
     assert _jobs(slurm)[jb]["state"] == "PENDING"                               # the fake really holds it
+
+
+def test_run_after_is_always_a_slurm_job(slurm, monkeypatch):
+    """llmt-runtime 2026.11.18.2: only a SLURM job can wait, so a short study with run.after is a job even below
+    LMPT_SLURM_MIN_MINUTES (a short study without it stays local)."""
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    monkeypatch.setenv("LMPT_SLURM_MIN_MINUTES", "60")
+    folder = api.start({"a": LJ, "b": {**LJ, "run": {"after": "a"}}})
+    meta = json.loads((folder / "request.json").read_text())
+    assert meta["executor"] == {"a": "local", "b": "slurm"}, meta["executor"]
+    assert meta["estimate_min"]["b"] < 60 and (folder / "b" / "job.json").is_file()
+    t0 = time.time()                                                            # let the local study finish
+    while not (folder / "a" / "a.json").is_file() and time.time() - t0 < 60:
+        time.sleep(0.2)
+
+
+def test_run_after_refused_without_slurm(tmp_path, monkeypatch):
+    monkeypatch.setenv("LMPT_OUT", str(tmp_path))                              # conftest: LMPT_EXECUTOR unset = local
+    v = api.validate({"a": LJ, "b": {**LJ, "run": {"after": "a"}}})
+    assert not v["ok"] and v["studies"]["a"]["ok"] and not v["studies"]["b"]["ok"]
+    assert any("SLURM" in e for e in v["studies"]["b"]["errors"]), v["studies"]["b"]["errors"]
