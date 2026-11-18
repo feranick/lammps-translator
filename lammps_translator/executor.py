@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.09.4
+Version: 2026.11.18.1
 
 2026.11.09.4: queued_note / print_queued_note, what `lmpt run` and `lmpt bench` say when interrupted while waiting for
 SLURM jobs (the job ids still queued and how to cancel them; nothing is cancelled).
@@ -77,7 +77,7 @@ def kind() -> str:
     return S.kind(RT)
 
 
-RUN_KEYS = ("timeout_s", "mem", "procs", "queue")
+RUN_KEYS = ("timeout_s", "mem", "procs", "queue", "after", "after_mode")   # run.after: llmt-runtime's
 run_of = S.run_of          # the study's "run" block, {} when absent
 parse_mem_mb = S.mem_mb    # SLURM sizes: 500M, 8G, 1T, 2048 (MB), 512K; None if malformed
 
@@ -113,7 +113,7 @@ def check_run(study: dict) -> list[str]:
     c = caps()
     if r is not None:
         if not isinstance(r, dict):
-            return ['run: an object {timeout_s, mem, procs, queue} (all optional)']
+            return ['run: an object {timeout_s, mem, procs, queue, after, after_mode} (all optional)']
         unknown = sorted(set(r) - set(RUN_KEYS))
         if unknown:
             E.append(f"run: unknown keys {unknown}; allowed {list(RUN_KEYS)} (no sbatch arguments from a study)")
@@ -676,7 +676,8 @@ def ended_state(d: Path, jid: str, listed: str | None = None) -> dict:
 
 
 def study_state(request: Path, name: str, q: dict | None) -> dict:
-    """State of a SLURM study: done (with 'result'), queued (reason, expected_start, ahead; 'submitting' while the
+    """State of a SLURM study: done (with 'result'), waiting (run.after: other runs not ended yet, llmt-runtime's
+    waiting_detail), queued (reason, expected_start, ahead; 'submitting' while the
     budgeted submission is under way), running (LAMMPS's progress, job_elapsed_min), unknown (squeue failed), or one of
     FINAL. squeue's states are llmt-runtime's: queued (jobs.QUEUED), running (jobs.ACTIVE), anything else an ended job
     squeue still lists (MinJobAge: it read as running before 2026.11.09.3)."""
@@ -701,6 +702,10 @@ def study_state(request: Path, name: str, q: dict | None) -> dict:
     if q is None:
         return {"state": "unknown", "job_id": jid, "why": "squeue failed: cannot tell the job's state now"}
     qi = q.get(jid)
+    if qi is not None and qi["state"] in J.QUEUED and job.get("run_after"):
+        w = J.waiting_detail(RT, job)          # run.after: waiting for other runs (llmt-runtime's state and reason)
+        if w:
+            return {**w, "job_id": jid}
     if qi is not None and qi["state"] in J.QUEUED:
         out = {"state": "queued", "job_id": jid, "reason": qi["reason"]}
         if qi["start"] and qi["start"] not in ("N/A", "Unknown", "None"):

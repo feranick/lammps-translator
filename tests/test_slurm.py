@@ -1,6 +1,6 @@
 """SLURM executor tests with llmt-runtime's fake sbatch/squeue/scancel/sacct/sinfo/scontrol
 (llmt_runtime.testing.fake_slurm; lmpt's own tests/fakeslurm.py until 2026.11.09.2, its file knobs now the merged
-fake's FAKE_* variables and job records). Version: 2026.11.09.3
+fake's FAKE_* variables and job records). Version: 2026.11.18.1
 They run anywhere; with LAMMPS (set LMPT_LMP, or lmp on the PATH) the jobs also compute real results."""
 import json
 import os
@@ -563,3 +563,48 @@ def test_request_name_submits_once(slurm, monkeypatch):
     assert "error" in api.run({"lj": LJ}, wait=0, request_name="bench_1")
     (Path(r["request"]).parent / "run_half").mkdir()
     assert "holds no request" in api.run({"lj": LJ}, wait=0, request_name="run_half")["error"]
+
+
+# ------------------------------------------------------------------- run.after (llmt-runtime 2026.11.18.1)
+def test_validate_run_after(slurm):
+    v = api.validate({"a": LJ, "b": {**LJ, "run": {"after": "a"}}, "c": {**LJ, "run": {"after": ["a", "b"],
+                                                                                        "after_mode": "ok"}}})
+    assert v["ok"] and all(v["studies"][n]["ok"] for n in "abc"), v
+    assert v["studies"]["b"]["estimate"]["procs"] >= 1
+    v = api.validate({"a": LJ, "b": {**LJ, "run": {"after": "zz"}}, "c": {**LJ, "run": {"after": "c"}},
+                      "d": {**LJ, "run": {"after": "a", "after_mode": "x"}}, "e": {**LJ, "run": {"after_mode": "ok"}}})
+    s = v["studies"]
+    assert not v["ok"] and s["a"]["ok"]
+    assert any("no study 'zz'" in e for e in s["b"]["errors"]) and "estimate" not in s["b"]
+    assert any("cannot wait for itself" in e for e in s["c"]["errors"])
+    assert any("run.after_mode" in e for e in s["d"]["errors"])
+    assert any("needs run.after" in e for e in s["e"]["errors"])
+    from lammps_translator.format import validate_study
+    assert validate_study({**LJ, "run": {"after": "a"}})["ok"]                 # the key check alone accepts it
+    assert not validate_study({**LJ, "run": {"afterwards": "a"}})["ok"]
+
+
+def test_run_after_waits_for_the_other_job(slurm, monkeypatch):
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    r = api.run({"a": LJ, "b": {**LJ, "run": {"after": "a"}}}, wait=0)
+    req = Path(r["request"])
+    ja, jb = (json.loads((req / n / "job.json").read_text()) for n in "ab")
+    assert jb.get("run_after") and f"--dependency=afterany:{ja['job_id']}" in " ".join(jb["command"]), jb
+    r = api.run({"x": {**LJ, "run": {"after": "nothere"}}}, wait=0)             # refused before any submission
+    assert r["studies"]["x"]["ok"] is False and not (Path(r["request"]) / "x" / "job.json").exists()
+
+
+def test_run_after_job_is_waiting(slurm, monkeypatch):
+    monkeypatch.setenv("FAKE_DEPENDENCIES", "1")
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")                             # a stays queued: b waits for it
+    r = api.run({"a": LJ}, wait=0)
+    monkeypatch.delenv("FAKE_SBATCH_PENDING")
+    first = Path(r["request"]).name
+    r2 = api.run({"b": {**LJ, "run": {"after": f"{first}/a"}}}, wait=0)        # another request's study
+    assert r2["pending"] == ["b"], r2
+    rows = {Path(q["request"]).name: q for q in api.jobs(active=True)["requests"]}
+    assert rows[Path(r2["request"]).name]["studies"]["b"]["state"] == "waiting", rows
+    st = api.status(r2["request"])["progress"]["b"]
+    assert st["state"] == "waiting" and st["reason"].startswith(f"after {first}/a"), st
+    jb = json.loads((Path(r2["request"]) / "b" / "job.json").read_text())["job_id"]
+    assert _jobs(slurm)[jb]["state"] == "PENDING"                               # the fake really holds it

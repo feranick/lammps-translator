@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.09.4
+Version: 2026.11.18.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks (builds the structures, finds potential files; no LAMMPS run)
@@ -71,8 +71,29 @@ def study_format() -> dict:
     return {**_format(), "translator": __version__, "status": tool_status()}
 
 
+def _after_problems(request, name: str, study: dict, studies: dict) -> list[str]:
+    """run.after / run.after_mode (llmt-runtime's after_problems): the runs waited for exist on this machine, no
+    cycle, not itself. Only for a study whose run has either key."""
+    r = study.get("run") if isinstance(study, dict) else None
+    if not isinstance(r, dict) or not {"after", "after_mode"} & set(r):
+        return []
+    from .runtime import RT
+    return RT.jobs.after_problems(request, name, study, studies)
+
+
 def validate(studies: dict) -> dict:
-    return _validate(studies)
+    v = _validate(studies)
+    if not isinstance(studies, dict):
+        return v
+    for n, rec in (v.get("studies") or {}).items():
+        if not rec.get("ok") or n not in studies:
+            continue
+        ap = _after_problems(None, n, studies[n], studies)
+        if ap:
+            rec.update(ok=False, errors=ap + rec.get("errors", []))
+            rec.pop("estimate", None)
+            v["ok"] = False
+    return v
 
 
 def _run_one(job: dict) -> dict:
@@ -271,6 +292,10 @@ def start(studies: dict, prefix: str = "run", extra: dict | None = None, budget_
         studies = {}
     for n, st in studies.items():
         v = validate_study(st)
+        if v["ok"]:                            # run.after: checked with the request folder, before any submission
+            ap = _after_problems(folder, n, st, studies)
+            if ap:
+                v = {**v, "ok": False, "errors": ap + v["errors"]}
         if not v["ok"]:
             invalid[n] = {"ok": False, "why": "invalid study", "errors": v["errors"], "warnings": v["warnings"]}
             continue
@@ -415,7 +440,7 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
                 if k in st and k not in row:
                     row[k] = st[k]
             sts[n] = row
-        is_active = any(v["state"] in ("queued", "running", "unknown") for v in sts.values())
+        is_active = any(v["state"] in ("queued", "waiting", "running", "unknown") for v in sts.values())
         if active and not is_active:
             continue
         out.append({"request": str(d), "started": time.strftime("%Y-%m-%d %H:%M:%S",

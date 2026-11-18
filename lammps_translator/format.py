@@ -1,5 +1,5 @@
 """format.py — the study format (what an LLM reads first) and static validation with fixable messages.
-Version: 2026.11.7.1
+Version: 2026.11.18.1
 """
 from __future__ import annotations
 
@@ -90,7 +90,8 @@ def study_format() -> dict:
             "procs": "MPI ranks (default LMPT_PROCS or 1; SLURM --ntasks)", "seed": "random seed (12345)",
             "expect": "checks", "queue": "with LMPT_EXECUTOR=slurm: true always a SLURM job, false always local "
                                          "(default: by the time estimate)",
-            "run": "{timeout_s, mem ('12G'), procs, queue}: this study's run limits, within status.executor.caps",
+            "run": "{timeout_s, mem ('12G'), procs, queue, after ('<request>/<study>', '<study>' or a list: start "
+                   "when those runs of this machine have ended), after_mode (any | ok)}: within status.executor.caps",
         },
         "system": {
             "lattice": {"kind": {**LATTICE_DOC},

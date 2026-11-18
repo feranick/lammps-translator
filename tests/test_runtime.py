@@ -1,7 +1,7 @@
 """lmpt on llmt-runtime: the shared pieces are the runtime's, configured for lmpt (2026.11.09.1, phase 1: workers, out
 of memory, ended_state, versions; a LAMMPS run killed for memory is out of memory, not timed out. 2026.11.09.3, phase
 2: the SLURM layer, with lmpt's sizing as hooks. 2026.11.09.4, phase 3: the MCP server's common code, stale.GUARD).
-Version: 2026.11.09.4
+Version: 2026.11.18.1
 """
 import asyncio
 import json
@@ -188,7 +188,8 @@ def test_job_sh_and_job_json(slurm, monkeypatch):
     sh = (req / "a" / "job.sh").read_text().splitlines()
     assert [ln for ln in sh if ln.startswith("#SBATCH")] == [
         "#SBATCH --job-name=lmpt:run_j:a", f"#SBATCH --chdir={req / 'a'}", f"#SBATCH --output={req / 'a' / 'job.log'}",
-        "#SBATCH --ntasks=3", "#SBATCH --ntasks-per-core=1", "#SBATCH --time=370", "#SBATCH --mem=2048M",
+        "#SBATCH --ntasks=3", "#SBATCH --nodes=1", "#SBATCH --ntasks-per-core=1", "#SBATCH --time=370",   # --nodes=1:
+        "#SBATCH --mem=2048M",                                                    # llmt-runtime 2026.11.11.2
         "#SBATCH --export=ALL"]
     assert sh[0] == "#!/bin/bash" and sh[-1].startswith("exec ")
     assert sh[-1].endswith(f"-m lammps_translator.cli run-study {req} a")
