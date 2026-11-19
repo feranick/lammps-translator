@@ -13,10 +13,10 @@ On the machine that runs LAMMPS (Ubuntu; LAMMPS 4 Jul 2026 from the Debian packa
 ```
 cd ~/Software && git clone https://github.com/feranick/lammps-translator.git    # or: cd lammps-translator && git pull
 source ~/Software/build123d-translator/.venv/bin/activate                          # shared venv (alias cad)
-pip install -e "$HOME/Software/llmt-runtime"     # the translators' shared runtime (>= 2026.11.18.2), first (or: pip install -r requirements-standalone.txt)
+pip install -e "$HOME/Software/llmt-runtime"     # the translators' shared runtime (>= 2026.11.18.5), first (or: pip install -r requirements-standalone.txt)
 pip install -e "$HOME/Software/lammps-translator[mcp,test]"
 lmpt status            # LAMMPS found? version, packages, potentials folders, fea-translator
-pytest -q              # 104 tests: 92 run anywhere (SLURM ones with llmt-runtime's fake), 12 need LAMMPS
+pytest -q              # 105 tests: 93 run anywhere (SLURM ones with llmt-runtime's fake), 12 need LAMMPS
 lmpt bench             # benchmarks (~17 s); slow ones by name: lmpt bench spce_water (~9 min, run it from the shell)
 ```
 
@@ -196,6 +196,7 @@ tests/test_lmpt.py  tests/test_slurm.py  tests/test_server.py  tests/test_runtim
 
 | version | changes |
 |---|---|
+| 2026.11.18.3 | The run pool is made by llmt-runtime's `workers.make_pool` (floor `llmt-runtime>=2026.11.18.5`): where an MCP client's sandbox refuses worker processes (the Gemini Mac app's Local MCP: `SemLock` `PermissionError` EPERM, found with b3dt), `run_studies` answers with a tool error "worker processes are not permitted here (the MCP client's sandbox): give this app Full Access, or run through the router" instead of a bare `PermissionError`, the request's local studies get a result with that reason, and the server keeps answering. One test. 105 tests. |
 | 2026.11.18.2 | Floor `llmt-runtime>=2026.11.18.2`: a study with `run.after` is always a SLURM job with `LMPT_EXECUTOR=slurm`, even below `LMPT_SLURM_MIN_MINUTES` (only a SLURM job can wait; the local pool would start it at once), and validation refuses `run.after` with a local executor or `queue: false` (the runtime's `use_slurm` and `after_problems`; no lmpt code change). Two tests for it. 104 tests. |
 | 2026.11.18.1 | `run.after` / `run.after_mode` accepted (run keys, the `run:` hint, study_format) and checked with llmt-runtime's `after_problems`, in `validate_studies` and in `run_studies` before any submission (llm-translators' run.after prompt; cfdt 2026.11.18.3 the reference); `study_status` and `jobs()` report such a study as `waiting` (llmt-runtime's `waiting_detail` in lmpt's own `study_state`; `jobs(active=True)` counts it). Floor `llmt-runtime>=2026.11.18.1`. `test_job_sh_and_job_json` expects `#SBATCH --nodes=1` (llmt-runtime 2026.11.11.2 adds it to every one-node MPI job). 102 tests against llmt-runtime 2026.11.18.2. |
 | 2026.11.09.6 | Tests only (llmt-runtime PLANNING.md, lmpt's open items): `conftest.py` stops the server's worker pool (`api._POOL`) when the session ends, so the suite no longer ends with `Pool.__del__` tracebacks, and gives `$USER` a default (`test`) when it is unset (cron, some CI, `sudo -E`); the two subprocess tests in `test_server.py` keep `PYTHONPATH` (an llmt-runtime checkout on it, not installed) instead of replacing it. 99 tests pass with `USER` unset. |

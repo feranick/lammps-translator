@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.18.1
+Version: 2026.11.18.3
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks (builds the structures, finds potential files; no LAMMPS run)
@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import base64
 import json
-import multiprocessing as mp
 import os
 import threading
 import time
@@ -114,9 +113,9 @@ class _Pool:
         workers = int(os.environ.get("LMPT_WORKERS", "2"))
         timeout = float(os.environ.get("LMPT_TIMEOUT", "21600"))
         if self.pool is None:
+            from llmt_runtime.workers import make_pool   # WorkersNotPermitted where a sandbox refuses a pool
             from .workers import watch_parent       # every worker (and its LAMMPS runs) ends with this server
-            self.pool = mp.get_context("spawn").Pool(workers, maxtasksperchild=10, initializer=watch_parent,
-                                                     initargs=(os.getpid(),))
+            self.pool = make_pool(workers, maxtasksperchild=10, initializer=watch_parent, initargs=(os.getpid(),))
         self.jobs[str(folder)] = {j["name"]: self.pool.apply_async(_run_one, (dict(j, timeout=timeout),)) for j in jobs}
 
 
@@ -314,7 +313,16 @@ def start(studies: dict, prefix: str = "run", extra: dict | None = None, budget_
         RT, names=names, invalid=invalid, started=time.time(), executor=where, estimate_min=est,
         studies={n: studies[n] for n in names}, **(extra or {})))
     if jobs:
-        _POOL.submit(folder, jobs)
+        from llmt_runtime.workers import WorkersNotPermitted
+        try:
+            _POOL.submit(folder, jobs)
+        except WorkersNotPermitted as exc:   # the caller gets the tool error; the request records why for status
+            for j in jobs:
+                d = folder / j["name"]
+                d.mkdir(parents=True, exist_ok=True)
+                X._atomic_json(d / f"{j['name']}.json", {"ok": False, "name": j["name"], "state": "failed",
+                                                         "why": str(exc)})
+            raise
     todo = [n for n in names if where[n] == "slurm"]
     while todo and time.time() - t0 < budget_s:
         n = todo.pop(0)

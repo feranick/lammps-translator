@@ -1,5 +1,5 @@
 """MCP server behaviour: stale servers after a deploy (llm-translators docs/SHARED.md) and tools that return
-within wait_s. Version: 2026.11.09.6
+within wait_s. Version: 2026.11.18.3
 
 2026.11.09.4: the stale handling is llmt-runtime's server.Server (stale.GUARD); the tests set its package folder,
 state, busy() and exit instead of stale.STATE['pkg'], stale.pool_busy and stale._exit_soon."""
@@ -206,3 +206,26 @@ def test_pool_workers_watch_their_parent(tmp_path, monkeypatch):
 def _watcher_started():
     from lammps_translator import workers
     return workers._STARTED["pid"] == os.getpid()
+
+
+def test_pool_refused_by_a_sandbox_is_the_tools_error(tmp_path, monkeypatch):
+    """llmt-runtime 2026.11.18.5: where a sandbox refuses the pool (Gemini's Local MCP: SemLock EPERM), run_studies'
+    answer is a tool error with the runtime's text, the study's result says why, and the server answers the next call."""
+    from llmt_runtime import workers as W
+    from lammps_translator import mcp_server as m
+
+    def refused(*a, **k):
+        raise W.WorkersNotPermitted(PermissionError(1, "Operation not permitted"))
+    monkeypatch.setenv("LMPT_OUT", str(tmp_path))
+    monkeypatch.setattr(GUARD, "stale", lambda: None)
+    monkeypatch.setattr(W, "make_pool", refused)
+    monkeypatch.setattr(api._POOL, "pool", None)
+    with pytest.raises(m.ToolError, match="worker processes are not permitted here") as e:
+        asyncio.run(m.server.call_tool("run_studies", {"studies": {"lj": LJ}, "wait_s": 5}))
+    assert "Operation not permitted" in str(e.value)
+    req = sorted(tmp_path.glob("run_*"))[-1]
+    res = json.loads((req / "lj" / "lj.json").read_text())
+    assert res["ok"] is False and "not permitted here" in res["why"]
+    r = asyncio.run(m.server.call_tool("validate_studies", {"studies": {"lj": LJ}}))   # the server is still up
+    assert '"ok": true' in str(r)
+    assert api.status(str(req))["studies"]["lj"]["ok"] is False
